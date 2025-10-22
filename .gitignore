@@ -1,56 +1,17 @@
-# Python bytecode
+# Ignore Python cache and compiled files
 __pycache__/
-*.py[cod]
-*$py.class
+*.pyc
+*.pyo
+*.pyd
 
-# Virtual envs
+# Virtual environment
 venv/
-.venv/
-env/
-ENV/
-.python-version
+.env/
 
-# IDEs / Editors
-.vscode/
-.idea/
-
-# OS
+# System files
 .DS_Store
 Thumbs.db
 
-# Logs / runtime files
-*.log
-*.pid
-
-# Secrets / env
-.env
-.env.*
-secrets.json
-config.json
-
-# Temp / uploads (we keep user data ephemeral)
+# Temporary or user-uploaded files
 uploads/
 sessions/
-tmp/
-temp/
-__temp__/
-
-# Data / ML artifacts (do NOT commit data or trained models)
-*.csv
-*.xls
-*.xlsx
-*.pkl
-*.joblib
-*.model
-*.sav
-
-# Build / reports
-build/
-dist/
-reports/
-*.html
-*.pdf
-
-# Cache
-.cache/
-__pypackages__/

@@ -1,0 +1,309 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Churn and retention analysis — Customer Churn Analytics</title>
+  <meta name="description" content="ChurnInsight — upload data, train churn models, run simulations, and get recommendations." />
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+
+  <!-- Minimal inline styles to ensure a clean look even before custom CSS -->
+  <style>
+    :root{
+      --bg:#0f1724; --card:#0b1220; --muted:#94a3b8; --accent:#06b6d4; --glass: rgba(255,255,255,0.03);
+      --radius:14px; --gap:18px; --maxw:1200px;
+    }
+    html,body{height:100%;margin:0;font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial;color:#e6eef6;background:linear-gradient(180deg,#071025 0%, #071827 100%);}
+    .container{max-width:var(--maxw);margin:28px auto;padding:18px;box-sizing:border-box;}
+    header.topbar{display:flex;align-items:center;gap:16px;padding:14px;border-radius:12px;background:linear-gradient(90deg, rgba(255,255,255,0.02), transparent);box-shadow:0 6px 20px rgba(2,6,23,0.6);position:sticky;top:12px;z-index:40;}
+    .brand{display:flex;align-items:center;gap:12px}
+    .logo{width:44px;height:44px;border-radius:10px;background:linear-gradient(135deg,var(--accent),#4f46e5);display:grid;place-items:center;color:#021124;font-weight:700;box-shadow:0 6px 24px rgba(6,182,212,0.12)}
+    .brand h1{margin:0;font-size:18px}
+    nav.nav{margin-left:auto;display:flex;gap:10px;align-items:center}
+    nav.nav a{color:var(--muted);text-decoration:none;padding:8px 12px;border-radius:10px;font-size:14px}
+    nav.nav a:hover{background:var(--glass);color:#fff}
+    .session-badge{background:rgba(255,255,255,0.03);padding:8px 10px;border-radius:10px;color:var(--muted);font-size:13px}
+    main{margin-top:18px;display:grid;grid-template-columns:1fr;gap:18px}
+    .panel{background:linear-gradient(180deg, rgba(0, 0, 0, 0.02), rgba(255,255,255,0.01));border-radius:var(--radius);padding:18px;box-shadow:0 6px 18px rgba(2,6,23,0.5);border:1px solid rgba(255,255,255,0.03)}
+    .panel h2{margin:0 0 12px 0;font-size:18px;color:#fff}
+    .muted{color:var(--muted);font-size:13px}
+    .grid-2{display:grid;grid-template-columns:1fr 420px;gap:18px}
+    .form-row{display:flex;gap:8px;align-items:center;margin-bottom:10px}
+    input[type="file"]{display:block}
+    input[type="text"], input[type="number"], select{padding:10px;border-radius:8px;border:1px solid rgba(255,255,255,0.04);background:transparent;color:#e6eef6;width:100%}
+    button.primary{background:linear-gradient(90deg,var(--accent),#7c3aed);color:#021124;border:none;padding:10px 16px;border-radius:10px;font-weight:600;cursor:pointer}
+    button.ghost{background:transparent;border:1px solid rgba(255,255,255,0.04);padding:8px 12px;border-radius:10px;color:var(--muted)}
+    .result{margin-top:12px;padding:12px;border-radius:10px;background:rgba(255,255,255,0.02);min-height:44px;color:#e6eef6;overflow:auto;max-height:440px}
+    .preview {max-height:280px;overflow:auto;border-radius:8px}
+    .row{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+    .small{font-size:13px;color:var(--muted)}
+    .chat-window{height:320px;overflow:auto;padding:12px;border-radius:10px;background:linear-gradient(180deg, rgba(255,255,255,0.02), transparent)}
+    .msg{padding:8px 12px;border-radius:14px;display:inline-block;max-width:85%;margin-bottom:8px}
+    .msg.user{background:#06364f;color:#dff6ff;margin-left:auto}
+    .msg.bot{background:rgba(255,255,255,0.03);color:#e6eef6}
+    footer{margin-top:18px;text-align:center;color:var(--muted);font-size:13px}
+    .footer-row{display:flex;justify-content:center;gap:12px;align-items:center}
+    @media (max-width:980px){ .grid-2{grid-template-columns:1fr} nav.nav{display:none} .container{margin:8px} }
+  </style>
+
+  <!-- Expose the session id to the page and scripts -->
+  <script>window.SESSION_ID = "{{ session_id }}";</script>
+</head>
+<body>
+  <div class="container" role="application" aria-label="ChurnInsight single page application">
+
+    <header class="topbar" role="banner" aria-label="Top Navigation">
+      <div class="brand" aria-hidden="false">
+        <div class="logo" aria-hidden="true">CR</div>
+        <div>
+          <h1>Churn-retention analysis</h1>
+          <div class="small muted">Upload → Analyze → Train → Simulate → Act</div>
+        </div>
+      </div>
+
+      <nav class="nav" role="navigation" aria-label="Primary">
+        <a href="#upload" class="nav-link">Upload</a>
+        <a href="#eda" class="nav-link">EDA</a>
+        <a href="#train" class="nav-link">Train</a>
+        <a href="#simulate" class="nav-link">Simulate</a>
+        <a href="#chat" class="nav-link">Chat</a>
+      </nav>
+
+      <div style="margin-left:12px;" class="session-badge" title="Session ID">
+        Session: <span id="sessionId">{{ session_id }}</span>
+      </div>
+    </header>
+
+    <main>
+      <!-- Intro / Overview Panel -->
+      <section class="panel" style="text-align:center;background:rgba(255,255,255,0.02)">
+        <h2 style="color:#fff;margin-bottom:8px;">Welcome to Churn-Retention-Analysis</h2>
+        <p class="small muted" style="max-width:720px;margin:auto;line-height:1.6">
+          Churn-Retention-analysis is an AI-powered churn analysis and retention platform. 
+          Upload your customer data, explore patterns, train churn prediction models, 
+          and simulate retention strategies — all in one place.
+          <br><br>
+          <strong>Workflow:</strong> Upload → Analyze → Train → Predict → Explain → Simulate → Chat
+        </p>
+      </section>
+
+      <!-- Upload -->
+      <section id="upload" class="panel" aria-labelledby="upload-title">
+        <h2 id="upload-title">1. Upload dataset</h2>
+        <p class="small muted">Upload a CSV or XLSX file. Character encoding is auto-detected. Preview limited to 1000×1000 cells.</p>
+
+        <form id="uploadForm" enctype="multipart/form-data" novalidate>
+          <input type="hidden" name="session_id" value="{{ session_id }}">
+          <div class="form-row">
+            <input id="fileInput" name="file" type="file" accept=".csv,.xlsx" aria-label="Upload dataset file" required>
+            <button id="uploadBtn" class="primary" type="submit">Upload & Preview</button>
+            <button id="clearUploadBtn" class="ghost" type="button">Clear</button>
+          </div>
+        </form>
+
+        <div id="uploadResult" class="result" aria-live="polite">
+          <div class="muted">No file uploaded yet.</div>
+        </div>
+      </section>
+
+      <!-- EDA + Train side-by-side -->
+      <section id="eda-train" class="grid-2">
+        <!-- Quick EDA -->
+        <div class="panel" id="eda">
+          <h2>2. Quick EDA</h2>
+          <p class="small muted">Summary of uploaded data (rows, columns, missing values). Click "Run Full EDA" for a deeper report.</p>
+          <div id="edaSummary" class="result">
+            <div class="muted">Upload a dataset to see EDA summary.</div>
+          </div>
+          <div style="margin-top:12px" class="row">
+            <button id="fullEdaBtn" class="ghost" type="button">Run Full EDA</button>
+            <button id="downloadPreviewBtn" class="ghost" type="button">Download Preview</button>
+          </div>
+          <div id="edaFullResult" class="result" style="margin-top:12px"></div>
+        </div>
+
+        <!-- Train -->
+        <div class="panel" id="train">
+          <h2>3. Train model</h2>
+          <p class="small muted">Select target column and model. Use fast mode for quick iteration.</p>
+          <form id="trainForm" novalidate>
+            <input type="hidden" name="session_id" value="{{ session_id }}">
+            <div class="form-row">
+              <label style="flex:1">
+                <div class="small muted">Target column</div>
+                <input type="text" name="target_col" placeholder="e.g., Churn" required aria-label="Target column name">
+              </label>
+            </div>
+            <div class="form-row">
+              <label style="flex:1">
+                <div class="small muted">Model</div>
+                <select name="model_type" aria-label="Model type">
+                  <option value="logistic">Logistic Regression</option>
+                  <option value="randomforest">Random Forest</option>
+                  <option value="decisiontree">Decision Tree</option>
+                  <option value="gradientboost">Gradient Boosting</option>
+                  <option value="adaboost">AdaBoost</option>
+                  <option value="knn">K-Nearest Neighbors</option>
+                  <option value="svm">Support Vector Machine</option>
+                  <option value="naivebayes">Naive Bayes</option>
+                  <option value="xgboost">XGBoost (optional)</option>
+                  <option value="catboost">CatBoost (optional)</option>
+                </select>
+              </label>
+              <label>
+                <div class="small muted">Mode</div>
+                <select name="mode" aria-label="Training mode">
+                  <option value="fast">Fast (sample / split)</option>
+                  <option value="full">Full (train on all rows)</option>
+                </select>
+              </label>
+            </div>
+
+            <div class="form-row" title="Optional: when using Fast mode, sample ratio selects test size (0.0-1.0)">
+              <label style="flex:1">
+                <div class="small muted">Test size (only for Fast mode)</div>
+                <input type="number" name="sample_ratio" min="0.01" max="0.49" step="0.01" placeholder="0.2" aria-label="Test size (sample ratio)">
+              </label>
+              <label style="display:flex;align-items:center;gap:8px">
+                <input type="checkbox" id="computeCv" name="compute_cv" aria-label="Compute cross-validation estimate">
+                <div class="small muted">Compute CV (full mode only)</div>
+              </label>
+            </div>
+
+            <div class="form-row">
+              <button id="trainBtn" class="primary" type="submit">Train</button>
+              <button id="retrainBtn" class="ghost" type="button">Retrain</button>
+            </div>
+          </form>
+
+          <div id="trainResult" class="result small"></div>
+          <div style="margin-top:10px" id="modelMetrics" class="small muted"></div>
+        </div>
+      </section>
+
+      <!-- Predict / Explain -->
+      <section id="predict-explain" class="grid-2">
+        <div class="panel" id="predict">
+          <h2>4. Predict</h2>
+          <p class="small muted">Run predictions on the current dataset or upload a new file for scoring.</p>
+          <form id="predictForm" enctype="multipart/form-data" novalidate>
+            <input type="hidden" name="session_id" value="{{ session_id }}">
+            <div class="form-row">
+              <label style="flex:1" class="small muted">Optional: Upload file for prediction</label>
+              <input type="file" name="file" accept=".csv,.xlsx" aria-label="Prediction file">
+            </div>
+            <div class="form-row">
+              <button id="predictBtn" class="primary" type="submit">Run Prediction</button>
+            </div>
+          </form>
+          <div id="predictResult" class="result small muted">No predictions yet.</div>
+        </div>
+
+        <div class="panel" id="explain">
+          <h2>5. Explain (per-customer)</h2>
+          <p class="small muted">Provide a row index or upload a single-row CSV for a SHAP-based explanation.</p>
+          <form id="explainForm" enctype="multipart/form-data" novalidate>
+            <input type="hidden" name="session_id" value="{{ session_id }}">
+            <div class="form-row">
+              <label style="flex:1">
+                <div class="small muted">Row index (0-based)</div>
+                <input type="number" name="row_index" min="0" aria-label="Row index for explanation" />
+              </label>
+            </div>
+            <div class="form-row">
+              <label style="flex:1">
+                <div class="small muted">Or upload single-row CSV</div>
+                <input type="file" name="file" accept=".csv" aria-label="Single row file for explanation" />
+              </label>
+            </div>
+            <div class="form-row">
+              <button id="explainBtn" class="primary" type="submit">Explain</button>
+            </div>
+          </form>
+          <div id="explainResult" class="result small muted">No explanation yet.</div>
+        </div>
+      </section>
+
+      <!-- Simulation -->
+      <section id="simulate" class="panel">
+        <h2>6. Simulate retention actions</h2>
+        <p class="small muted">Test interventions (discounts, extended contracts) and estimate retained customers, revenue saved and ROI.</p>
+        <form id="simulateForm" novalidate>
+          <input type="hidden" name="session_id" value="{{ session_id }}">
+          <div class="form-row">
+            <label>
+              <div class="small muted">Discount (%)</div>
+              <input name="discount_pct" type="number" step="0.1" min="0" placeholder="e.g., 10" aria-label="Discount percentage">
+            </label>
+            <label>
+              <div class="small muted">Extend months</div>
+              <input name="extend_months" type="number" min="0" placeholder="e.g., 3" aria-label="Extend months">
+            </label>
+            <label>
+              <div class="small muted">Target threshold (0-1)</div>
+              <input name="target_threshold" type="number" step="0.01" min="0" max="1" placeholder="0.7" aria-label="Target probability threshold">
+            </label>
+            <label>
+              <div class="small muted">Cost per customer ($)</div>
+              <input name="cost_per_customer" type="number" step="0.1" min="0" placeholder="e.g., 5" aria-label="Cost per customer">
+            </label>
+          </div>
+          <div class="form-row">
+            <button id="simulateBtn" class="primary" type="submit">Run Simulation</button>
+            <button id="simulateClear" class="ghost" type="button">Reset</button>
+          </div>
+        </form>
+        <div id="simulateResult" class="result small muted">No simulation run.</div>
+      </section>
+
+      <!-- Chatbot -->
+      <section id="chat" class="panel" aria-labelledby="chat-title">
+        <h2 id="chat-title">7. Chat Assistant</h2>
+        <p class="small muted">Ask questions about the dataset, model, or simulations. Toggle LLM for advanced suggestions (opt-in).</p>
+
+        <div style="display:flex;align-items:center;gap:12px;margin-bottom:8px">
+          <label class="small muted" for="enableLLM"><input id="enableLLM" type="checkbox" /> Enable LLM assistant</label>
+          <div class="small muted" style="margin-left:auto">LLM calls are redacted and sent only with your opt-in.</div>
+        </div>
+
+        <div id="chatWindow" class="chat-window" role="log" aria-live="polite" aria-atomic="false">
+          <div class="muted small">Chat is ready — ask something like "What is the churn rate?"</div>
+        </div>
+
+        <form id="chatForm" style="margin-top:10px" novalidate>
+          <input type="hidden" name="session_id" value="{{ session_id }}">
+          <div style="display:flex;gap:8px">
+            <input id="chatInput" name="query" type="text" placeholder="Ask about churn, drivers, ROI or say 'recommend actions'..." aria-label="Chat input" style="flex:1" />
+            <button id="chatBtn" class="primary" type="submit">Send</button>
+          </div>
+        </form>
+        <div id="chatHint" class="small muted" style="margin-top:8px">Tip: enable LLM for broader, domain-aware recommendations (requires OPENAI_API_KEY in server env).</div>
+      </section>
+
+      <footer>
+        <div class="footer-row">
+          <button id="endSessionBtn" class="ghost" type="button">End Session — Clear Data</button>
+        </div>
+        <div style="margin-top:8px" class="small muted">All uploaded data is ephemeral and cleared when session ends or tab closes.</div>
+        <div style="margin-top:6px;font-size:12px;color:var(--muted)">developed by Yaswanth Himanshu</div>
+      </footer>
+
+    </main>
+  </div>
+
+  <!-- Optional script modules (your JS will hook to these IDs) -->
+  <script src="{{ url_for('static', filename='charts.js') }}"></script>
+  <script src="{{ url_for('static', filename='main.js') }}"></script>
+
+  <!-- Small accessibility helper: focus chat input on pressing "/" -->
+  <script>
+    document.addEventListener('keydown', function(e){
+      if(e.key === '/' && document.activeElement.tagName !== 'INPUT' && document.activeElement.tagName !== 'TEXTAREA') {
+        e.preventDefault();
+        const input = document.getElementById('chatInput');
+        if(input) { input.focus(); input.select(); }
+      }
+    });
+  </script>
+</body>
+</html>
