@@ -8,7 +8,7 @@ chardet
 openpyxl
 joblib
 matplotlib
-openai
+openai>=1.0.0
 gunicorn
 xgboost
 catboost

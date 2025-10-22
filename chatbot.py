@@ -19,8 +19,6 @@ import os
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-
-# Optional imports
 try:
     from sklearn.feature_extraction.text import TfidfVectorizer
     from sklearn.metrics.pairwise import cosine_similarity
@@ -29,7 +27,7 @@ except Exception:
     SKLEARN_AVAILABLE = False
 
 try:
-    import openai
+    from openai import OpenAI
     OPENAI_AVAILABLE = True
 except Exception:
     OPENAI_AVAILABLE = False
@@ -445,25 +443,31 @@ def _build_user_prompt(query: str, safe_context: Dict[str, Any]) -> str:
 def _call_openai_chat(system_prompt: str, user_prompt: str, model: str, max_tokens: int = 800, temperature: float = 0.0, timeout: int = 20) -> str:
     if not OPENAI_AVAILABLE:
         raise RuntimeError("OpenAI SDK not available. Install `openai` to enable LLM mode.")
-    api_key = OPENAI_API_KEY
+    
+    api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY not set in environment.")
-    openai.api_key = api_key
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt}
-    ]
-    resp = openai.ChatCompletion.create(
+    
+    # ✅ Initialize the new OpenAI client
+    client = OpenAI(api_key=api_key)
+    
+    # ✅ Use the new Chat Completions endpoint
+    resp = client.chat.completions.create(
         model=model,
-        messages=messages,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ],
         max_tokens=max_tokens,
-        temperature=temperature,
-        request_timeout=timeout
+        temperature=temperature
     )
-    if resp and "choices" in resp and len(resp["choices"]) > 0:
-        content = resp["choices"][0]["message"]["content"]
+    
+    # ✅ Return the chat content
+    if resp and resp.choices and len(resp.choices) > 0:
+        content = resp.choices[0].message.content
         return content.strip()
     return "LLM returned no content."
+
 
 # -------------------------
 # Fallback helper for open questions
