@@ -1,0 +1,14 @@
+flask
+pandas
+numpy
+scikit-learn
+scipy
+shap
+chardet
+openpyxl
+joblib
+matplotlib
+openai
+gunicorn
+xgboost
+catboost
