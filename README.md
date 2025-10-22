@@ -101,7 +101,6 @@ It combines **machine learning**, **explainable AI (SHAP)**, and **business ROI 
 ## 💼 Ideal Use Cases  
 - Businesses analyzing **customer churn and retention** patterns.  
 - **Data science students** demonstrating real-world predictive analytics.  
-- **Final-year / Capstone projects (SDP)** showcasing applied ML, explainability, and business intelligence integration.  
 
 ---
 
@@ -130,4 +129,5 @@ It combines **machine learning**, **explainable AI (SHAP)**, and **business ROI 
 
 **Developed by:** *Yaswanth Himanshu*  
 📊 *An intelligent, privacy-first customer churn prediction & retention optimization system.*
+
 
