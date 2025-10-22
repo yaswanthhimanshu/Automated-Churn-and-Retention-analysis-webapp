@@ -17,6 +17,9 @@ import re
 import difflib
 import os
 
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+
 # Optional imports
 try:
     from sklearn.feature_extraction.text import TfidfVectorizer
@@ -442,7 +445,7 @@ def _build_user_prompt(query: str, safe_context: Dict[str, Any]) -> str:
 def _call_openai_chat(system_prompt: str, user_prompt: str, model: str, max_tokens: int = 800, temperature: float = 0.0, timeout: int = 20) -> str:
     if not OPENAI_AVAILABLE:
         raise RuntimeError("OpenAI SDK not available. Install `openai` to enable LLM mode.")
-    api_key = os.environ.get("OPENAI_API_KEY")
+    api_key = OPENAI_API_KEY
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY not set in environment.")
     openai.api_key = api_key
