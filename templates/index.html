@@ -139,15 +139,13 @@
                 <div class="small muted">Model</div>
                 <select name="model_type" aria-label="Model type">
                   <option value="logistic">Logistic Regression</option>
+                  <option value="catboost">CatBoost</option>
                   <option value="randomforest">Random Forest</option>
                   <option value="decisiontree">Decision Tree</option>
                   <option value="gradientboost">Gradient Boosting</option>
                   <option value="adaboost">AdaBoost</option>
-                  <option value="knn">K-Nearest Neighbors</option>
-                  <option value="svm">Support Vector Machine</option>
                   <option value="naivebayes">Naive Bayes</option>
-                  <option value="xgboost">XGBoost (optional)</option>
-                  <option value="catboost">CatBoost (optional)</option>
+                  <option value="xgboost">XGBoost</option>
                 </select>
               </label>
               <label>
@@ -290,7 +288,7 @@
     </main>
   </div>
 
-  <!-- Optional script modules (your JS will hook to these IDs) -->
+  <!-- hook java script  -->
   <script src="{{ url_for('static', filename='charts.js') }}"></script>
   <script src="{{ url_for('static', filename='main.js') }}"></script>
 

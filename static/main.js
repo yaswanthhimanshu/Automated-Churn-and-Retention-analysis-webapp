@@ -1,7 +1,5 @@
 // static/main.js
-// Frontend wiring for ChurnInsight single-page app.
-// Upgraded: richer inline dashboards for Train / Predict / Explain.
-// Only UI/dashboard code changed — backend and HTML unchanged.
+// Frontend wiring for Churn and Retention analysis single-page app.
 
 (() => {
   "use strict";
@@ -108,10 +106,10 @@
 }
 
 
-  // store current session id globally for updates
+  // stores current session id globally for updates
   let CURRENT_SID = SID;
 
-  // update hidden inputs + window var when server provides new session id
+  // updates hidden inputs + window var when server provides new session id
   function updateSessionId(newSid) {
     if (!newSid) return;
     CURRENT_SID = newSid;
@@ -127,7 +125,7 @@
     return "<pre style='white-space:pre-wrap;margin:0;font-size:13px;color:var(--muted)'>" + escapeHtml(JSON.stringify(obj, null, 2)) + "</pre>";
   }
 
-  // --- Dashboard render helpers (new) ---
+  // --- Dashboard render helpers  ---
   function formatCurrency(v) {
     if (v === null || v === undefined || Number.isNaN(Number(v))) return "-";
     return Number(v).toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2});
@@ -169,7 +167,6 @@
   }
 
   function renderFeatureContributions(contribs) {
-    // contribs: { feature: number, ... }
     if (!contribs) return "<div class='muted'>No feature contributions available.</div>";
     const items = Object.entries(contribs).sort((a,b)=>Math.abs(b[1])-Math.abs(a[1])).slice(0,30);
     let html = "<div style='margin-top:8px;display:flex;flex-direction:column;gap:6px;'>";
@@ -261,7 +258,7 @@
     });
   }
 
-  // Full EDA click (unchanged)
+  // Full EDA click 
   const fullEdaBtn = el("#fullEdaBtn");
   if (fullEdaBtn) {
     fullEdaBtn.addEventListener("click", async (ev) => {
@@ -295,7 +292,7 @@
     });
   }
 
-  // --- Train (enhanced rendering) ---
+  // --- Train  ---
   const trainForm = el("#trainForm");
   if (trainForm) {
     trainForm.addEventListener("submit", async (ev) => {
@@ -315,16 +312,12 @@
         const data = await res.json();
         if (data.session_id) updateSessionId(data.session_id);
 
-        // Build training dashboard
+        //  training dashboard
         let html = `<div style="margin-bottom:8px"><strong style="color:#fff">Training Dashboard</strong></div>`;
-        if (data.kpis && Object.keys(data.kpis).length) {
+        if (data.meta && data.meta.n_rows) {
           html += "<div style='display:flex;gap:10px;flex-wrap:wrap;margin-bottom:8px'>";
-          if (data.kpis.churn_rate !== undefined) {
-            html += renderKpiCard("Churn rate", ((data.kpis.churn_rate||0)*100).toFixed(2) + "%", "From training labels");
-          }
-          if (data.kpis.n_rows !== undefined) {
-            html += renderKpiCard("Rows (labelled)", data.kpis.n_rows, "Rows used to train");
-          }
+          html += renderKpiCard("Churn rate", ((data.kpis?.churn_rate || 0) * 100).toFixed(2) + "%", "From training labels");
+          html += renderKpiCard("Rows (labelled)", data.meta.n_rows, "Rows used to train");
           html += "</div>";
         }
 
@@ -367,7 +360,7 @@
   const retrainBtn = el("#retrainBtn");
   if (retrainBtn) retrainBtn.addEventListener("click", () => trainForm && trainForm.requestSubmit());
 
-  // --- Predict (enhanced rendering) ---
+  // --- Predict  ---
   const predictForm = el("#predictForm");
   if (predictForm) {
     predictForm.addEventListener("submit", async (ev) => {
@@ -418,16 +411,7 @@
 
           setResult("#predictResult", html);
           showToast("Prediction dashboard ready");
-        } else {
-          // fallback to CSV download
-          const blob = await res.blob();
-          const fname = "predictions.csv";
-          const url = URL.createObjectURL(blob);
-          const a = document.createElement("a");
-          a.href = url; a.download = fname; document.body.appendChild(a); a.click(); a.remove();
-          setResult("#predictResult", "<div class='muted'>Downloaded predictions (" + fname + ")</div>");
-          showToast("Predictions downloaded");
-        }
+        } 
       } catch (err) {
         console.error("Predict error", err);
         setResult("#predictResult", "<div class='muted'>Prediction failed: " + escapeHtml(err.message || "") + "</div>");
@@ -438,7 +422,7 @@
     });
   }
 
-  // --- Explain (enhanced rendering) ---
+  // --- Explain  ---
   const explainForm = el("#explainForm");
   if (explainForm) {
     explainForm.addEventListener("submit", async (ev) => {
@@ -459,7 +443,7 @@
         const data = await res.json();
         if (data.session_id) updateSessionId(data.session_id);
 
-        // Render explanation
+        //explanation
         const ex = data.explanation || data;
         let html = `<div style="margin-bottom:8px"><strong style="color:#fff">Per-customer Explanation</strong></div>`;
         if (ex.predicted_churn !== undefined) {
@@ -490,7 +474,7 @@
     });
   }
 
-  // --- Simulation (unchanged) ---
+  // --- Simulation
   const simulateForm = el("#simulateForm");
   if (simulateForm) {
     simulateForm.addEventListener("submit", async (ev) => {
@@ -519,7 +503,7 @@
     });
   }
 
-  // --- Chat (unchanged) ---
+  // --- Chat 
   const chatForm = el("#chatForm");
   const chatWindow = el("#chatWindow");
   function appendChat(text, who="bot") {
@@ -562,7 +546,7 @@
     });
   }
 
-  // End session button (unchanged behavior)
+  // End session button
   const endBtn = el("#endSessionBtn");
   if (endBtn) {
     endBtn.addEventListener("click", async (ev) => {
@@ -583,7 +567,7 @@
     });
   }
 
-  // Auto-clear on unload (best-effort) — unchanged
+  // Auto-clear on unload 
   window.addEventListener("unload", (ev) => {
     try {
       const payload = JSON.stringify({ session_id: CURRENT_SID || "" });

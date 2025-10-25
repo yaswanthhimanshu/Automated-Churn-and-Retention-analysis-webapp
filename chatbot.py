@@ -1,8 +1,5 @@
 """
 chatbot.py
-
-Hybrid chatbot for ChurnInsight.
-
 Public API:
     respond_to_query(query: str, context: dict, use_llm: bool = False, llm_provider: str = "openai", llm_model: str = "gpt-4o-mini") -> str
 

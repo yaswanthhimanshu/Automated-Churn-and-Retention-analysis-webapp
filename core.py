@@ -1,5 +1,5 @@
 """
-core.py — Core data + ML engine for ChurnInsight (finalized)
+core.py 
 
 Key points:
 - Robust reader for CSV/XLSX bytes (chardet + fallbacks).
@@ -240,26 +240,22 @@ def preprocess_for_model(df: pd.DataFrame, target_col: str, fit: bool = True,
     return X_scaled, np.asarray(y), encoders, imputer, scaler
 
 # ---------------------------
-# Model factory (many models)
+# Model factory 
 # ---------------------------
 def get_model(model_type: str):
     mt = (model_type or "randomforest").lower().replace(" ", "")
     models = {
         "logistic": LogisticRegression(max_iter=1000, solver="lbfgs"),
-        "randomforest": RandomForestClassifier(n_estimators=150, random_state=42),
+        "catboost": CatBoostClassifier(iterations=300, learning_rate=0.1, depth=6, verbose=False, allow_writing_files=False),
+        "randomforest": RandomForestClassifier(n_estimators=150, random_state=42, n_jobs=-1),
         "decisiontree": DecisionTreeClassifier(random_state=42),
         "gradientboost": GradientBoostingClassifier(random_state=42),
         "adaboost": AdaBoostClassifier(random_state=42),
-        "knn": KNeighborsClassifier(n_neighbors=5),
-        "svm": SVC(probability=True, kernel="rbf"),
         "naivebayes": GaussianNB(),
+        "xgboost": XGBClassifier(n_estimators=200, learning_rate=0.1, max_depth=5, random_state=42, use_label_encoder=False, eval_metric="logloss"),
     }
-    # Add optional heavy models only if available
-    if (mt in ("xgboost", "xgb")) and XGBClassifier is not None:
-        models["xgboost"] = XGBClassifier(n_estimators=200, learning_rate=0.1, max_depth=5, random_state=42, use_label_encoder=False, eval_metric="logloss")
-    if (mt in ("catboost", "catb")) and CatBoostClassifier is not None:
-        models["catboost"] = CatBoostClassifier(iterations=300, learning_rate=0.1, depth=6, verbose=False)
     return models.get(mt, models["randomforest"])
+
 
 # ---------------------------
 # Internal metrics helper
@@ -398,17 +394,16 @@ def train_model(df: pd.DataFrame,
             "test_size": float(sample_ratio or 0.2),
             "metrics": metrics,
             "n_train": int(len(y_train)),
-            "n_test": int(len(y_test))
+            "n_test": int(len(y_test)),
+            "n_rows": int(len(y_train))
         }
+
         return model_id, meta, model_obj
 
     except Exception as exc:
         traceback.print_exc()
         return "", {"status": "error", "error": str(exc)}, None
 
-# ---------------------------
-# Prediction
-# ---------------------------
 # ---------------------------
 # Prediction
 # ---------------------------
@@ -449,7 +444,7 @@ def predict_df(model: Any, df: pd.DataFrame) -> pd.DataFrame:
     probs = None
     try:
         proba = model.predict_proba(X_scaled)
-        # pick the probability for the positive class if available
+        # picks the probability for the positive class if available
         if hasattr(proba, "ndim") and proba.ndim == 2 and proba.shape[1] >= 2:
             probs = proba[:, 1].astype(float)
         else:
@@ -464,7 +459,7 @@ def predict_df(model: Any, df: pd.DataFrame) -> pd.DataFrame:
 
     # Build output safely
     out = df_copy.copy()
-    # Ensure numeric types and safe casting
+    # Ensures numeric types and safe casting
     out["churn_probability"] = np.clip(np.asarray(probs, dtype=float), 0.0, 1.0)
     # Some estimators return non-zero/non-one preds; coerce to 0/1 ints
     try:

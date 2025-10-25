@@ -1,5 +1,5 @@
 """
-app.py - single-page Flask controller for ChurnInsight (in-memory sessions, privacy-first)
+app.py
 
 Notes / high-level:
 - Sessions are in-memory and recovered automatically if user invokes endpoints before uploading.
@@ -92,7 +92,6 @@ def ensure_session(sid: Optional[str] = None):
     ns = new_session()
     return ns, get_session(ns)
 
-# (Cleanup thread intentionally NOT started — user requested no automatic TTL-based purging)
 
 # -----------------------
 # Helpers (responses)
@@ -121,7 +120,6 @@ def index():
     sid = new_session()
     return render_template("index.html", session_id=sid)
 
-# Upload: accept missing sid (auto-create), return session_id and EDA + preview
 @app.route("/upload", methods=["POST"])
 def upload():
     try:
