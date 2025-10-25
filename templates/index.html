@@ -259,11 +259,10 @@
       <!-- Chatbot -->
       <section id="chat" class="panel" aria-labelledby="chat-title">
         <h2 id="chat-title">7. Chat Assistant</h2>
-        <p class="small muted">Ask questions about the dataset, model, or simulations. Toggle LLM for advanced suggestions (opt-in).</p>
+        <p class="small muted">Ask questions about the dataset, model, or simulations. enable LLM for advanced suggestions.</p>
 
         <div style="display:flex;align-items:center;gap:12px;margin-bottom:8px">
           <label class="small muted" for="enableLLM"><input id="enableLLM" type="checkbox" /> Enable LLM assistant</label>
-          <div class="small muted" style="margin-left:auto">LLM calls are redacted and sent only with your opt-in.</div>
         </div>
 
         <div id="chatWindow" class="chat-window" role="log" aria-live="polite" aria-atomic="false">
@@ -277,7 +276,7 @@
             <button id="chatBtn" class="primary" type="submit">Send</button>
           </div>
         </form>
-        <div id="chatHint" class="small muted" style="margin-top:8px">Tip: enable LLM for broader, domain-aware recommendations (requires OPENAI_API_KEY in server env).</div>
+        <div id="chatHint" class="small muted" style="margin-top:8px">Tip: enable LLM for broader, domain-aware recommendations.</div>
       </section>
 
       <footer>
