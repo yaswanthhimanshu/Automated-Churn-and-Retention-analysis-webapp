@@ -1,13 +1,5 @@
-"""
-app.py
+#  app.py
 
-Notes / high-level:
-- Sessions are in-memory and recovered automatically if user invokes endpoints before uploading.
-- Automatic background session cleanup is disabled by default (you told me session TTL was annoying).
-- Predict endpoint now returns a JSON preview (dashboard-friendly) when requested (Accept header or preview flag).
-- Explain endpoint supports GET by row_index and POST single-row file upload.
-- Small, clear comments for each section (so you remember why it's there).
-"""
 
 import time
 import uuid
@@ -22,26 +14,25 @@ from flask import Flask, request, render_template, jsonify, send_file, make_resp
 import core
 import chatbot
 
+from dotenv import load_dotenv
+load_dotenv()
+
+
 # -----------------------
 # Flask app config
 # -----------------------
 app = Flask(__name__, template_folder="templates", static_folder="static")
 app.config['MAX_CONTENT_LENGTH'] = 250 * 1024 * 1024  # 250 MB
-# ephemeral secret ok for local/dev
 app.secret_key = uuid.uuid4().hex
 
 # -----------------------
 # In-memory sessions
 # -----------------------
-# NOTE: We keep sessions in memory. By your request, automatic cleanup is not enforced
-# (we avoid surprising the user by removing sessions while they are analyzing).
-# If you later want TTL-based cleanup re-enabled, you can re-enable the cleanup thread.
 
 IN_MEMORY_SESSIONS = {}
 
-# (left here for reference — TTL removed by default)
-SESSION_TTL_SECONDS = None  # set to None to disable automatic expiry
-CLEANUP_INTERVAL_SECONDS = 60  # used only if you re-enable cleanup
+SESSION_TTL_SECONDS = None  
+CLEANUP_INTERVAL_SECONDS = 60 
 
 def new_session():
     """Create a fresh session dictionary and return sid."""
@@ -63,7 +54,7 @@ def new_session():
     return sid
 
 def get_session(sid: Optional[str]):
-    """Return session by sid or None."""
+    """Returns session by sid or None."""
     if not sid:
         return None
     return IN_MEMORY_SESSIONS.get(sid)
@@ -116,7 +107,6 @@ def _make_csv_response(df, filename="predictions.csv"):
 
 @app.route("/")
 def index():
-    """Render SPA and provide a fresh session id."""
     sid = new_session()
     return render_template("index.html", session_id=sid)
 
@@ -211,7 +201,7 @@ def train():
         if not target_col or target_col not in df.columns:
             return _json_error("invalid or missing target column")
 
-        # model_type selection (many options supported via core.get_model)
+        # model_type selection 
         model_type = request.form.get("model_type", "logistic").strip() or "logistic"
 
         # mode (full or split)
@@ -230,6 +220,7 @@ def train():
             sample_ratio = None
 
         compute_cv = (request.form.get("compute_cv") or "false").lower() in ("1", "true", "yes", "y")
+        tune_model = (request.form.get("tune_model") or "false").lower() in ("1", "true", "yes", "y")
 
         # call core.train_model (returns model_id, meta, model_obj)
         model_id, meta, model_obj = core.train_model(
@@ -238,7 +229,8 @@ def train():
             model_type=model_type,
             sample_ratio=sample_ratio,
             mode=mode,
-            compute_cv=compute_cv
+            compute_cv=compute_cv,
+            tune_model=tune_model
         )
 
         # core returns metadata dict; handle errors
@@ -280,8 +272,7 @@ def train():
         traceback.print_exc()
         return _json_error(f"training failed: {str(e)}", 500)
 
-# Predict: returns JSON preview/dashboard info when requested (preview flag or Accept header),
-# otherwise returns CSV download.
+# Predict: returns  preview/dashboard info when requested 
 @app.route("/predict", methods=["POST"])
 def predict():
     try:
@@ -294,7 +285,7 @@ def predict():
         if not model_obj:
             return _json_error("no trained model")
 
-        # prefer uploaded file for scoring, else use session df
+        # prefers uploaded file for scoring, else use session df
         df_pred = None
         if "file" in request.files:
             try:
@@ -312,7 +303,6 @@ def predict():
         # Determine preview mode:
         accept = request.headers.get("Accept", "")
         preview_flag = (request.form.get("preview") or request.args.get("preview") or "").lower() in ("1", "true", "yes", "y")
-        # if browser requested JSON or preview flag, return dashboard-style JSON
         if "application/json" in accept or "text/html" in accept or preview_flag:
             preview_html = core.preview_df_html(predictions_df.head(200), max_rows=200, max_cols=50)
             churn_rate = float(predictions_df["predicted_churn"].mean())
@@ -339,8 +329,6 @@ def predict():
                 "rows_sample": predictions_df.head(200).to_dict(orient="records"),
                 "session_id": sid
             })
-
-        # default behavior: return CSV for download
         return _make_csv_response(predictions_df)
     except Exception as e:
         traceback.print_exc()
@@ -449,7 +437,7 @@ def chat():
         return _json_error(f"chatbot error: {str(e)}", 500)
 
 # -----------------------
-# Clear session: explicit only (accept JSON, form, args or raw)
+# Clear session:
 # -----------------------
 @app.route("/clear_session", methods=["POST"])
 def clear_session():

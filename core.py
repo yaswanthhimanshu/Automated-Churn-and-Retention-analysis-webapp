@@ -1,15 +1,5 @@
-"""
-core.py 
+#core.py 
 
-Key points:
-- Robust reader for CSV/XLSX bytes (chardet + fallbacks).
-- EDA: quick and full (numeric summary, correlation, top categories).
-- Preprocessing: stable categorical encoding (mapping), median imputation, standard scaling.
-- Model factory: many sklearn models, optional XGBoost / CatBoost if installed.
-- train_model supports "split" and "full" modes, safe test_size handling and stratify checks.
-- Predict, row explain (SHAP best-effort), and simulate ROI utilities.
-- No disk writes. All objects remain in memory (models have attached preprocessing artifacts).
-"""
 
 from typing import Tuple, Dict, Any, Optional
 import io
@@ -20,7 +10,7 @@ import chardet
 import pandas as pd
 import numpy as np
 
-from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.model_selection import train_test_split, cross_val_score, GridSearchCV
 from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
@@ -31,7 +21,7 @@ from sklearn.naive_bayes import GaussianNB
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.svm import SVC
 
-# Optional shap import (best-effort)
+# shap import 
 try:
     import shap  # type: ignore
     SHAP_AVAILABLE = True
@@ -40,7 +30,7 @@ except Exception:
     shap = None
     SHAP_AVAILABLE = False
 
-# Optional heavy libraries (best-effort)
+# heavy libraries 
 try:
     from xgboost import XGBClassifier  # type: ignore
 except Exception:
@@ -55,13 +45,6 @@ except Exception:
 # Safe file reading (CSV/XLSX)
 # ---------------------------
 def safe_read_csv_bytes(raw_bytes: bytes) -> Optional[pd.DataFrame]:
-    """
-    Robust reader for CSV / XLSX bytes:
-      - detects XLSX by PK header and tries pd.read_excel
-      - uses chardet to guess encoding, falls back to common encodings
-      - returns DataFrame or None on failure
-    Attaches _detected_encoding attribute to returned DataFrame.
-    """
     try:
         if raw_bytes is None:
             return None
@@ -109,10 +92,6 @@ def safe_read_csv_bytes(raw_bytes: bytes) -> Optional[pd.DataFrame]:
 # Preview generator
 # ---------------------------
 def preview_df_html(df: pd.DataFrame, max_rows: int = 1000, max_cols: int = 1000) -> str:
-    """
-    Return safe HTML preview capped to max_rows x max_cols.
-    Truncates very long strings for readability.
-    """
     try:
         r = min(max_rows, len(df))
         c = min(max_cols, df.shape[1])
@@ -143,13 +122,6 @@ def quick_eda(df: pd.DataFrame) -> Dict[str, Any]:
     return info
 
 def generate_full_report(df: pd.DataFrame, sample_limit: int = 50000) -> Dict[str, Any]:
-    """
-    Return a heavier EDA report:
-      - numeric_summary (describe)
-      - correlation (numeric)
-      - top_categories for categorical columns
-    Uses sampling when df larger than sample_limit.
-    """
     n = len(df)
     sample = df.sample(n=sample_limit, random_state=42) if n > sample_limit else df.copy()
     report = quick_eda(sample)
@@ -180,10 +152,6 @@ def generate_full_report(df: pd.DataFrame, sample_limit: int = 50000) -> Dict[st
 # Categorical encoder utilities
 # ---------------------------
 def _fit_categorical_encoders(X: pd.DataFrame) -> Dict[str, Dict[Any, int]]:
-    """
-    For each non-numeric column create a stable mapping value -> int.
-    Unknown categories at transform time map to -1.
-    """
     encoders: Dict[str, Dict[Any, int]] = {}
     for col in X.columns:
         if not pd.api.types.is_numeric_dtype(X[col]):
@@ -199,9 +167,21 @@ def _transform_with_encoders(X: pd.DataFrame, encoders: Dict[str, Dict[Any, int]
         if col in Xt.columns:
             vals = Xt[col].astype(str).fillna("__MISSING__")
             Xt[col] = vals.map(lambda v: mapping.get(v, -1)).astype(float)
-    # For numeric columns not in encoders, keep original values
-    # Ensure order of columns remains the same as input X
     return Xt
+
+# ---------------------------
+# Target variable encoder
+# ---------------------------
+def _encode_target(y_series: pd.Series) -> np.ndarray:
+    if pd.api.types.is_numeric_dtype(y_series):
+        return np.where(y_series > 0, 1, 0).astype(int)
+
+    y_str = y_series.astype(str).str.lower().str.strip()
+    
+    positive_values = ['yes', 'true', '1', 'y', 'churn', 'positive']
+    
+    y_encoded = np.where(y_str.isin(positive_values), 1, 0)
+    return y_encoded.astype(int)
 
 # ---------------------------
 # Preprocessing for model
@@ -210,15 +190,11 @@ def preprocess_for_model(df: pd.DataFrame, target_col: str, fit: bool = True,
                          encoders: Optional[Dict[str, Dict[Any, int]]] = None,
                          imputer: Optional[SimpleImputer] = None,
                          scaler: Optional[StandardScaler] = None) -> Tuple[np.ndarray, np.ndarray, Dict[str, Dict[Any, int]], SimpleImputer, StandardScaler]:
-    """
-    Returns (X_scaled, y_array, encoders, imputer, scaler).
-    X_scaled is numpy array of shape (n_samples, n_features) where features correspond to df.drop(target_col).columns
-    """
     if target_col not in df.columns:
         raise ValueError(f"target_col {target_col} not in dataframe")
 
     dfc = df.copy()
-    y = dfc[target_col].values
+    y = _encode_target(dfc[target_col])
     X = dfc.drop(columns=[target_col])
 
     if fit or encoders is None:
@@ -242,6 +218,41 @@ def preprocess_for_model(df: pd.DataFrame, target_col: str, fit: bool = True,
 # ---------------------------
 # Model factory 
 # ---------------------------
+_PARAM_GRIDS = {
+    "logistic": {
+        'C': [0.1, 1.0, 10]
+    },
+    "randomforest": {
+        'n_estimators': [100, 150],
+        'max_depth': [5, 10, None],
+        'min_samples_leaf': [5, 10]
+    },
+    "decisiontree": {
+        'max_depth': [3, 5, 7, 10],
+        'min_samples_leaf': [5, 10, 20]
+    },
+    "gradientboost": {
+        'n_estimators': [100, 150],
+        'learning_rate': [0.01, 0.1],
+        'max_depth': [3, 5]
+    },
+    "xgboost": {
+        'n_estimators': [100, 150],
+        'learning_rate': [0.01, 0.1],
+        'max_depth': [3, 5]
+    },
+    "adaboost": {
+        'n_estimators': [50, 100],
+        'learning_rate': [0.1, 1.0]
+    },
+    "catboost": {
+        'iterations': [200, 300],
+        'depth': [4, 6],
+        'learning_rate': [0.05, 0.1]
+    },
+    "naivebayes": {},
+}
+
 def get_model(model_type: str):
     mt = (model_type or "randomforest").lower().replace(" ", "")
     models = {
@@ -282,21 +293,16 @@ def _compute_metrics(y_true, y_pred, y_proba=None) -> Dict[str, Any]:
     return out
 
 # ---------------------------
-# Train model (robust)
+# Train model 
 # ---------------------------
 def train_model(df: pd.DataFrame,
                 target_col: str,
                 model_type: str = "logistic",
                 sample_ratio: Optional[float] = 0.2,
                 mode: str = "split",
+                tune_model: bool = False,
                 compute_cv: bool = False,
                 cv_folds: int = 3) -> Tuple[str, Dict[str, Any], Any]:
-    """
-    Train and return (model_id, meta_dict, model_obj).
-    meta_dict contains status and metrics or an error key on failure.
-    mode: "split" (train/test split) or "full" (train on all rows).
-    sample_ratio: when mode=='split' it's the test_size; validated to (0,1).
-    """
     try:
         if target_col not in df.columns:
             raise ValueError("target_col not found in dataframe")
@@ -305,10 +311,8 @@ def train_model(df: pd.DataFrame,
         if df_clean.shape[0] == 0:
             raise ValueError("no rows with non-null target to train on")
 
-        # Preprocess using all columns except target (fit)
         X_all_scaled, y_all, encoders, imputer, scaler = preprocess_for_model(df_clean, target_col, fit=True)
 
-        # Ensure sample_ratio is valid only when in split mode
         if mode == "split":
             try:
                 sample_ratio = float(sample_ratio)
@@ -316,60 +320,51 @@ def train_model(df: pd.DataFrame,
                 sample_ratio = 0.2
             if not (0.0 < sample_ratio < 1.0):
                 sample_ratio = 0.2
-        else:
-            # ignore sample_ratio when mode == full
-            sample_ratio = None
+            
+            stratify = None
+            try:
+                if np.unique(y_all).size > 1:
+                    vals, counts = np.unique(y_all, return_counts=True)
+                    if np.min(counts) >= 2:
+                        stratify = y_all
+            except Exception:
+                stratify = None
 
-        # select estimator
+            X_train, X_test, y_train, y_test = train_test_split(
+                X_all_scaled, y_all, test_size=float(sample_ratio or 0.2), random_state=42, stratify=stratify
+            )
+        
+        else:
+            sample_ratio = None
+            X_train, y_train = X_all_scaled, y_all
+            X_test, y_test = X_all_scaled, y_all
+
         estimator = get_model(model_type)
 
-        if mode == "full":
-            # train on all rows
-            estimator.fit(X_all_scaled, y_all)
-            try:
-                y_pred = estimator.predict(X_all_scaled)
-            except Exception:
-                y_pred = np.zeros_like(y_all)
-            try:
-                y_proba = estimator.predict_proba(X_all_scaled)
-            except Exception:
-                y_proba = None
+        if tune_model:
+            model_key = model_type.lower().replace(" ", "")
+            param_grid = _PARAM_GRIDS.get(model_key, {})
+            
+            if param_grid:
+                print(f"--- Tuning hyperparameters for {model_type} ---")
+                
+                grid_search = GridSearchCV(
+                    estimator=estimator,
+                    param_grid=param_grid,
+                    cv=3,
+                    n_jobs=-1,
+                    scoring='accuracy'
+                )
+                
+                grid_search.fit(X_train, y_train)
+                estimator = grid_search.best_estimator_
+                print(f"Best params found: {grid_search.best_params_}")
+            else:
+                print(f"No parameter grid for {model_type}, using defaults.")
+                estimator.fit(X_train, y_train)
+        else:
+            estimator.fit(X_train, y_train)
 
-            metrics = _compute_metrics(y_all, y_pred, y_proba)
-
-            if compute_cv:
-                try:
-                    cv_scores = cross_val_score(estimator, X_all_scaled, y_all, cv=min(cv_folds, 5), scoring="accuracy", n_jobs=-1)
-                    metrics["cv_mean"] = float(np.mean(cv_scores))
-                    metrics["cv_std"] = float(np.std(cv_scores))
-                except Exception:
-                    pass
-
-            model_obj = estimator
-            model_obj.encoders = encoders
-            model_obj.imputer = imputer
-            model_obj.scaler = scaler
-            model_obj.target_col = target_col
-            model_id = f"{model_type}_{int(np.random.randint(1000, 9999))}"
-            return model_id, {"status": "success", "trained_on": "full", "metrics": metrics, "n_rows": int(len(y_all))}, model_obj
-
-        # ---------------------------
-        # split mode: safe stratify
-        # ---------------------------
-        stratify = None
-        try:
-            if np.unique(y_all).size > 1:
-                vals, counts = np.unique(y_all, return_counts=True)
-                if np.min(counts) >= 2:
-                    stratify = y_all
-        except Exception:
-            stratify = None
-
-        X_train, X_test, y_train, y_test = train_test_split(
-            X_all_scaled, y_all, test_size=float(sample_ratio or 0.2), random_state=42, stratify=stratify
-        )
-
-        estimator.fit(X_train, y_train)
         try:
             y_pred = estimator.predict(X_test)
         except Exception:
@@ -380,7 +375,15 @@ def train_model(df: pd.DataFrame,
             y_proba = None
 
         metrics = _compute_metrics(y_test, y_pred, y_proba)
-
+        
+        if compute_cv and mode == "split":
+            try:
+                cv_scores = cross_val_score(estimator, X_train, y_train, cv=min(cv_folds, 5), scoring="accuracy", n_jobs=-1)
+                metrics["cv_mean"] = float(np.mean(cv_scores))
+                metrics["cv_std"] = float(np.std(cv_scores))
+            except Exception:
+                pass
+        
         model_obj = estimator
         model_obj.encoders = encoders
         model_obj.imputer = imputer
@@ -388,15 +391,24 @@ def train_model(df: pd.DataFrame,
         model_obj.target_col = target_col
 
         model_id = f"{model_type}_{int(np.random.randint(1000, 9999))}"
-        meta = {
-            "status": "success",
-            "trained_on": "split",
-            "test_size": float(sample_ratio or 0.2),
-            "metrics": metrics,
-            "n_train": int(len(y_train)),
-            "n_test": int(len(y_test)),
-            "n_rows": int(len(y_train))
-        }
+        
+        if mode == "split":
+            meta = {
+                "status": "success",
+                "trained_on": "split",
+                "test_size": float(sample_ratio or 0.2),
+                "metrics": metrics,
+                "n_train": int(len(y_train)),
+                "n_test": int(len(y_test)), 
+                "n_rows": int(len(y_train))
+            }
+        else:
+             meta = {
+                "status": "success",
+                "trained_on": "full",
+                "metrics": metrics,
+                "n_rows": int(len(y_all))
+            }
 
         return model_id, meta, model_obj
 
@@ -408,20 +420,10 @@ def train_model(df: pd.DataFrame,
 # Prediction
 # ---------------------------
 def predict_df(model: Any, df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Use trained model to produce predictions for df.
-    Returns copy of df with:
-      - 'predicted_churn' (0/1 integer)
-      - 'churn_probability' (float in [0,1])
-    Defensive: accepts a df that may still contain the target column (string labels like "Yes"/"No")
-    and never attempts unsafe int() conversions.
-    """
     if not hasattr(model, "encoders") or not hasattr(model, "imputer") or not hasattr(model, "scaler"):
         raise ValueError("Model missing preprocessing artifacts. Train model using train_model first.")
 
     df_copy = df.copy()
-
-    # If the uploaded scoring file contains the original target column, drop it before transforming
     if hasattr(model, "target_col") and model.target_col in df_copy.columns:
         df_proc = df_copy.drop(columns=[model.target_col])
     else:
@@ -433,14 +435,14 @@ def predict_df(model: Any, df: pd.DataFrame) -> pd.DataFrame:
     X_imputed = model.imputer.transform(X_enc)
     X_scaled = model.scaler.transform(X_imputed)
 
-    # Predict (safe)
+    # Predict
     try:
         preds = model.predict(X_scaled)
     except Exception:
         # fallback: all zeros
         preds = np.zeros((X_scaled.shape[0],), dtype=int)
 
-    # Probability (best-effort)
+    # Probability
     probs = None
     try:
         proba = model.predict_proba(X_scaled)
@@ -457,15 +459,11 @@ def predict_df(model: Any, df: pd.DataFrame) -> pd.DataFrame:
         except Exception:
             probs = np.zeros((len(preds),), dtype=float)
 
-    # Build output safely
     out = df_copy.copy()
-    # Ensures numeric types and safe casting
     out["churn_probability"] = np.clip(np.asarray(probs, dtype=float), 0.0, 1.0)
-    # Some estimators return non-zero/non-one preds; coerce to 0/1 ints
     try:
         out["predicted_churn"] = np.where(np.asarray(preds, dtype=float) >= 0.5, 1, 0).astype(int)
     except Exception:
-        # fallback: if preds are not numeric, try to map common strings -> 0/1
         mapped = []
         for v in preds:
             try:
@@ -478,13 +476,9 @@ def predict_df(model: Any, df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 # ---------------------------
-# SHAP summary (best-effort)
+# SHAP summary 
 # ---------------------------
 def compute_shap_summary(model: Any, df: pd.DataFrame, sample_limit: int = 5000) -> Optional[Dict[str, Any]]:
-    """
-    Return top features by mean absolute SHAP value (best-effort).
-    Returns None if shap not available or explainer fails.
-    """
     if not SHAP_AVAILABLE:
         return None
     if not hasattr(model, "encoders"):
@@ -533,10 +527,6 @@ def compute_shap_summary(model: Any, df: pd.DataFrame, sample_limit: int = 5000)
 # Row-level explanation
 # ---------------------------
 def explain_row(model: Any, row_df: pd.DataFrame) -> Dict[str, Any]:
-    """
-    Return SHAP-based explanation for a single-row DataFrame (or fallback).
-    Returns dict with feature_contributions, predicted_churn and churn_probability.
-    """
     if not hasattr(model, "encoders") or not SHAP_AVAILABLE:
         preds_df = predict_df(model, row_df)
         row = preds_df.iloc[0]
@@ -590,12 +580,6 @@ def explain_row(model: Any, row_df: pd.DataFrame) -> Dict[str, Any]:
 # Simulation with ROI
 # ---------------------------
 def simulate_action_with_roi(model: Any, df: pd.DataFrame, action: Dict[str, Any], cost_per_customer: float = 0.0) -> Dict[str, Any]:
-    """
-    Heuristic simulation for retention actions:
-    - picks customers whose churn_probability >= target_threshold
-    - reduces their churn_probability by a heuristic reduction factor based on discount_pct and extend_months
-    - computes retained_customers, revenue_saved, action_cost and ROI
-    """
     if not hasattr(model, "encoders"):
         raise ValueError("Model must have preprocessing artifacts (train with train_model first).")
 

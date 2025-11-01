@@ -15,3 +15,5 @@ Thumbs.db
 # Temporary or user-uploaded files
 uploads/
 sessions/
+
+.env

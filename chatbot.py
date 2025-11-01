@@ -1,13 +1,6 @@
-"""
-chatbot.py
-Public API:
-    respond_to_query(query: str, context: dict, use_llm: bool = False, llm_provider: str = "openai", llm_model: str = "gpt-4o-mini") -> str
 
-Notes:
-- context is a dict containing keys like: "eda", "metrics", "shap", "simulate"
-- This module NEVER sends raw dataframe rows to an LLM. It builds a redacted summary.
-- Optional dependencies: openai, scikit-learn. The code works without them (LLM/fuzzy TF-IDF disabled).
-"""
+#chatbot.py
+
 
 from typing import Dict, Any, List, Tuple
 import re
@@ -437,30 +430,32 @@ def _build_user_prompt(query: str, safe_context: Dict[str, Any]) -> str:
     parts.append("Answer in 3-6 short bullets. When suggesting an action, include which cohort to target and a next step (e.g. run simulation).")
     return "\n".join(parts)
 
-def _call_openai_chat(system_prompt: str, user_prompt: str, model: str, max_tokens: int = 800, temperature: float = 0.0, timeout: int = 20) -> str:
+def _call_openai_chat(system_prompt: str, user_prompt: str, model: str, max_tokens: int = 800, temperature: float = 1.0, timeout: int = 180) -> str:
     if not OPENAI_AVAILABLE:
         raise RuntimeError("OpenAI SDK not available. Install `openai` to enable LLM mode.")
-    
+
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
-        raise RuntimeError("OPENAI_API_KEY not set in environment.")
-    
-    # ✅ Initialize the new OpenAI client
-    client = OpenAI(api_key=api_key)
-    
-    # ✅ Use the new Chat Completions endpoint
-    resp = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
-        ],
-        max_tokens=max_tokens,
-        temperature=temperature
-    )
-    
-    # ✅ Return the chat content
-    if resp and resp.choices and len(resp.choices) > 0:
+        raise RuntimeError("OPENAI_API_KEY not set in environment. (Did you add load_dotenv() to app.py?)")
+
+    client = OpenAI(api_key=api_key, timeout=float(timeout))
+
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            max_completion_tokens=max_tokens,
+        )
+        
+    except Exception as e:
+        print(f"!!!!!!!!!! OPENAI API CALL FAILED !!!!!!!!!!")
+        print(f"Error type: {type(e).__name__}, Error: {e}")
+        raise e
+
+    if resp and getattr(resp, "choices", None):
         content = resp.choices[0].message.content
         return content.strip()
     return "LLM returned no content."
