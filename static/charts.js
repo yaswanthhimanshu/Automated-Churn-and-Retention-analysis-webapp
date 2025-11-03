@@ -228,7 +228,7 @@
       renderCategoricalTop(root, report.top_categories);
     }
 
-    // fallback raw JSON if nothing else
+    // fallbacks raw JSON if nothing else
     if (!report.correlation && !report.top_categories && !report.numeric_summary) {
       const pre = document.createElement("pre");
       pre.style.whiteSpace = "pre-wrap";
@@ -243,7 +243,7 @@
     renderEdaFull
   };
 
-  // auto-run if page has eda JSON embedded in #edaFullResult data attribute
+  // auto-runs if page has eda JSON embedded in #edaFullResult data attribute
   document.addEventListener("DOMContentLoaded", function () {
     try {
       const raw = window._CHURN_EDA_FULL || null;

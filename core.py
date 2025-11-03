@@ -5,6 +5,7 @@ from typing import Tuple, Dict, Any, Optional
 import io
 import warnings
 import traceback
+import time
 
 import chardet
 import pandas as pd
@@ -23,7 +24,7 @@ from sklearn.svm import SVC
 
 # shap import 
 try:
-    import shap  # type: ignore
+    import shap  
     SHAP_AVAILABLE = True
     warnings.filterwarnings("ignore", category=UserWarning)
 except Exception:
@@ -32,12 +33,12 @@ except Exception:
 
 # heavy libraries 
 try:
-    from xgboost import XGBClassifier  # type: ignore
+    from xgboost import XGBClassifier  
 except Exception:
     XGBClassifier = None
 
 try:
-    from catboost import CatBoostClassifier  # type: ignore
+    from catboost import CatBoostClassifier  
 except Exception:
     CatBoostClassifier = None
 
@@ -302,8 +303,13 @@ def train_model(df: pd.DataFrame,
                 mode: str = "split",
                 tune_model: bool = False,
                 compute_cv: bool = False,
-                cv_folds: int = 3) -> Tuple[str, Dict[str, Any], Any]:
+                cv_folds: int = 3,
+                progress_callback: Optional[callable] = None) -> Tuple[str, Dict[str, Any], Any]:
     try:
+        if progress_callback: # <--- PROGRESS REPORT 1
+            progress_callback(5, "Preprocessing data...")
+            time.sleep(0.5)
+
         if target_col not in df.columns:
             raise ValueError("target_col not found in dataframe")
 
@@ -312,6 +318,10 @@ def train_model(df: pd.DataFrame,
             raise ValueError("no rows with non-null target to train on")
 
         X_all_scaled, y_all, encoders, imputer, scaler = preprocess_for_model(df_clean, target_col, fit=True)
+
+        if progress_callback: # <--- PROGRESS REPORT 2
+            progress_callback(20, "Scaling and splitting data...")
+            time.sleep(0.5)
 
         if mode == "split":
             try:
@@ -340,8 +350,13 @@ def train_model(df: pd.DataFrame,
             X_test, y_test = X_all_scaled, y_all
 
         estimator = get_model(model_type)
+        
 
         if tune_model:
+            if progress_callback: # <--- PROGRESS REPORT 3 (Tuning start)
+                progress_callback(35, "Tuning model hyperparameters...")
+                time.sleep(0.5)
+
             model_key = model_type.lower().replace(" ", "")
             param_grid = _PARAM_GRIDS.get(model_key, {})
             
@@ -362,8 +377,20 @@ def train_model(df: pd.DataFrame,
             else:
                 print(f"No parameter grid for {model_type}, using defaults.")
                 estimator.fit(X_train, y_train)
+
+            if progress_callback: # <--- PROGRESS REPORT 4a (After Tuning/Before final fit)
+                progress_callback(60, "Training final model...")
+                time.sleep(0.5)
         else:
+            if progress_callback: # <--- PROGRESS REPORT 4b (Non-tuning fit start)
+                progress_callback(50, f"Training {model_type} model...")
+                time.sleep(0.5)
+
             estimator.fit(X_train, y_train)
+
+        if progress_callback: # <--- PROGRESS REPORT 5 (Metrics start)
+            progress_callback(80, "Computing metrics...")
+            time.sleep(0.5)
 
         try:
             y_pred = estimator.predict(X_test)
@@ -409,6 +436,9 @@ def train_model(df: pd.DataFrame,
                 "metrics": metrics,
                 "n_rows": int(len(y_all))
             }
+             
+        if progress_callback: # <--- FINAL SUCCESS REPORT
+            progress_callback(100, "Success.")
 
         return model_id, meta, model_obj
 

@@ -9,6 +9,7 @@ from datetime import datetime
 from typing import Optional
 import pandas as pd
 from flask import Flask, request, render_template, jsonify, send_file, make_response
+import threading
 
 # local modules
 import core
@@ -50,6 +51,9 @@ def new_session():
         "created_ts": now_ts,
         "uploaded_at": None,
         "encoding": None,
+
+        "train_progress": 0,
+        "train_status_msg": "Idle",
     }
     return sid
 
@@ -201,6 +205,19 @@ def train():
         if not target_col or target_col not in df.columns:
             return _json_error("invalid or missing target column")
 
+        if session.get("train_progress", 0) > 0 and session.get("train_progress", 0) < 100:
+            return _json_error("Training is already running.", 409)
+
+        session.update({
+            "train_progress": 0,
+            "train_status_msg": "Queued",
+            "model": None,
+            "metrics": None,
+            "predictions": None,
+            "shap": None,
+            "simulate_result": None
+        })
+        
         # model_type selection 
         model_type = request.form.get("model_type", "logistic").strip() or "logistic"
 
@@ -222,55 +239,77 @@ def train():
         compute_cv = (request.form.get("compute_cv") or "false").lower() in ("1", "true", "yes", "y")
         tune_model = (request.form.get("tune_model") or "false").lower() in ("1", "true", "yes", "y")
 
-        # call core.train_model (returns model_id, meta, model_obj)
-        model_id, meta, model_obj = core.train_model(
-            df=df,
-            target_col=target_col,
-            model_type=model_type,
-            sample_ratio=sample_ratio,
-            mode=mode,
-            compute_cv=compute_cv,
-            tune_model=tune_model
+
+        def train_task(sid, df, target_col, model_type, sample_ratio, mode, compute_cv, tune_model):
+            """Wrapper function to run the training and update session."""
+            
+            def progress_callback(progress_pct, msg):
+                s = get_session(sid)
+                if s:
+                    s["train_progress"] = progress_pct
+                    s["train_status_msg"] = msg
+                    
+            try:
+                progress_callback(1, "Starting training thread...")
+                
+                # call core.train_model (returns model_id, meta, model_obj)
+                model_id, meta, model_obj = core.train_model(
+                    df=df, target_col=target_col, model_type=model_type,
+                    sample_ratio=sample_ratio, mode=mode,
+                    compute_cv=compute_cv, tune_model=tune_model,
+                    progress_callback=progress_callback
+                )
+                
+                s = get_session(sid)
+                if not s:
+                    return
+
+                # core returns metadata dict; handle errors
+                if not meta or (isinstance(meta, dict) and meta.get("status") == "error"):
+                    msg = meta.get("error") if isinstance(meta, dict) else "training failed"
+                    progress_callback(-1, f"Training failed: {msg}")
+                    return
+
+                # save model & metrics so prediction/explain/simulate can use it
+                s["model"] = model_obj
+                s["metrics"] = meta.get("metrics") if isinstance(meta, dict) else None
+                s["meta"] = meta
+                
+                progress_callback(95, "Computing SHAP summary...")
+                time.sleep(0.5)
+                
+                # shap best-effort
+                try:
+                    shap_summary = core.compute_shap_summary(model_obj, df, sample_limit=5000)
+                    s["shap"] = shap_summary
+                except Exception:
+                    s["shap"] = None
+                
+                if s["train_progress"] < 100:
+                     progress_callback(100, "Success.")
+
+            except Exception as e:
+                s = get_session(sid)
+                if s:
+                    s["train_progress"] = -1
+                    s["train_status_msg"] = f"Training error: {str(e)}"
+                traceback.print_exc()
+
+        thread = threading.Thread(
+            target=train_task, 
+            args=(sid, df.copy(), target_col, model_type, sample_ratio, mode, compute_cv, tune_model)
         )
-
-        # core returns metadata dict; handle errors
-        if not meta or (isinstance(meta, dict) and meta.get("status") == "error"):
-            msg = meta.get("error") if isinstance(meta, dict) else "training failed"
-            return _json_error(f"training failed: {msg}", 400)
-
-        # save model & metrics so prediction/explain/simulate can use it
-        session["model"] = model_obj
-        session["metrics"] = meta.get("metrics") if isinstance(meta, dict) else None
-
-        # shap best-effort
-        try:
-            shap_summary = core.compute_shap_summary(model_obj, df, sample_limit=5000)
-            session["shap"] = shap_summary
-        except Exception:
-            session["shap"] = None
-
-        # small KPIs (churn_rate and n_rows) for dashboard
-        kpis = {}
-        try:
-            y = df[target_col]
-            if len(y.dropna()) > 0:
-                mapped = y.map(lambda v: 1 if str(v).strip().lower() in ("1", "yes", "true", "y", "churn") else 0) \
-                          if not (pd.api.types.is_numeric_dtype(y)) else y
-                kpis["churn_rate"] = float(mapped.dropna().mean())
-                kpis["n_rows"] = int(len(mapped.dropna()))
-        except Exception:
-            pass
-
+        thread.start()
+        
         return jsonify({
-            "model_id": model_id,
-            "meta": meta,
-            "shap": session["shap"],
-            "kpis": kpis,
-            "session_id": sid
-        })
+            "status": "training_started",
+            "message": "Training started asynchronously. Poll /train_status for progress.",
+            "session_id": sid,
+            "progress": 0
+        }), 202 
     except Exception as e:
         traceback.print_exc()
-        return _json_error(f"training failed: {str(e)}", 500)
+        return _json_error(f"training failed to start: {str(e)}", 500)
 
 # Predict: returns  preview/dashboard info when requested 
 @app.route("/predict", methods=["POST"])
@@ -300,7 +339,7 @@ def predict():
         predictions_df = core.predict_df(model_obj, df_pred.copy())
         session["predictions"] = predictions_df
 
-        # Determine preview mode:
+        # Determined preview mode:
         accept = request.headers.get("Accept", "")
         preview_flag = (request.form.get("preview") or request.args.get("preview") or "").lower() in ("1", "true", "yes", "y")
         if "application/json" in accept or "text/html" in accept or preview_flag:
@@ -333,6 +372,63 @@ def predict():
     except Exception as e:
         traceback.print_exc()
         return _json_error(f"prediction failed: {str(e)}", 500)
+    
+# -----------------------
+# Training Status Route 
+# -----------------------
+@app.route("/train_status", methods=["GET"])
+def train_status():
+    sid_in = request.args.get("session_id")
+    sid, session = ensure_session(sid_in)
+    
+    if not session:
+        return _json_error("invalid session", 404)
+
+    progress = session.get("train_progress", 0)
+    msg = session.get("train_status_msg", "Idle")
+
+    if progress >= 100 or progress == -1:
+        meta = session.get("meta", {})
+        
+        kpis = {}
+        if progress >= 100 and session.get("df") is not None:
+            try:
+                df = session["df"]
+                target_col = None
+                if hasattr(session.get("model"), 'target_col'):
+                    target_col = session["model"].target_col
+                
+                if target_col and target_col in df.columns:
+                    y = df[target_col]
+                    if len(y.dropna()) > 0:
+                        mapped = y.map(lambda v: 1 if str(v).strip().lower() in ("1", "yes", "true", "y", "churn") else 0) \
+                                if not (pd.api.types.is_numeric_dtype(y)) else y
+                        kpis["churn_rate"] = float(mapped.dropna().mean())
+            except Exception:
+                pass 
+
+        if "n_rows" not in meta:
+             if meta.get("trained_on") == "split":
+                 meta["n_rows"] = meta.get("n_train")
+             else:
+                 meta["n_rows"] = session.get("df").shape[0] if session.get("df") is not None else 0
+        
+        return jsonify({
+            "status": "completed" if progress >= 100 else "failed",
+            "progress": progress,
+            "message": msg,
+            "meta": meta,
+            "shap": session.get("shap"),
+            "kpis": kpis,
+            "session_id": sid
+        })
+
+    return jsonify({
+        "status": "in_progress",
+        "progress": progress,
+        "message": msg,
+        "session_id": sid
+    })
 
 # -----------------------
 # Explain (per-row) route

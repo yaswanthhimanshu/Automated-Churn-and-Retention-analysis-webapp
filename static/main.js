@@ -1,5 +1,5 @@
 // static/main.js
-// Frontend wiring for Churn and Retention analysis single-page app.
+// Frontend wiring for Churn and Retention analysis single-page webapp.
 
 (() => {
   "use strict";
@@ -138,7 +138,61 @@
               ${hint ? `<div style="font-size:12px;color:var(--muted);margin-top:6px">${escapeHtml(hint)}</div>` : ""}
             </div>`;
   }
+  
 
+  function renderProgressBar(pct, msg) {
+      const p = Math.max(0, Math.min(100, pct));
+      const isError = pct === -1;
+      // Use --danger from style.css if it exists, otherwise a fallback red
+      const barColor = isError ? "var(--danger, #ef4444)" : "linear-gradient(90deg, var(--accent), var(--accent-2))";
+      const textColor = isError ? "var(--danger, #ef4444)" : "var(--text, #e6eef6)";
+      return `<div style="margin-top:10px;padding:8px;border-radius:10px;background:rgba(255,255,255,0.02);border:1px solid ${isError ? 'var(--danger, #ef4444)' : 'rgba(255,255,255,0.04)'}">
+                <div style="font-size:13px;font-weight:600;color:${textColor};margin-bottom:6px">${escapeHtml(msg)} (${p}%)</div>
+                <div style="height:8px;border-radius:4px;background:rgba(255,255,255,0.05);overflow:hidden">
+                  <div id="trainProgressFill" style="height:100%;width:${p}%;background:${barColor};transition:width 0.5s ease"></div>
+                </div>
+              </div>`;
+  }
+
+  // Helper function to render the final train dashboard
+  function renderTrainDashboard(data) {
+      let html = `<div style="margin-bottom:8px"><strong style="color:var(--text)">Training Dashboard</strong></div>`;
+      
+      // KPI cards
+      if (data.meta && data.meta.n_rows) {
+          html += "<div style='display:flex;gap:10px;flex-wrap:wrap;margin-bottom:8px'>";
+          html += renderKpiCard("Churn rate", ((data.kpis?.churn_rate || 0) * 100).toFixed(2) + "%", "From training labels");
+          html += renderKpiCard("Rows (labelled)", data.meta.n_rows, "Rows used to train");
+          html += "</div>";
+      }
+
+      // Model metrics
+      if (data.meta && data.meta.metrics) {
+          html += `<div style="margin-top:6px"><strong style="color:var(--text)">Model metrics</strong></div>`;
+          html += renderMetricList(data.meta.metrics);
+      }
+
+      // SHAP summary (top features)
+      if (data.shap && data.shap.top_features) {
+          html += `<div style="margin-top:10px"><strong style="color:var(--text)">Top features (SHAP)</strong></div>`;
+          html += "<div style='margin-top:8px;display:flex;flex-direction:column;gap:6px'>";
+          data.shap.top_features.slice(0,12).forEach(f => {
+            html += `<div style="display:flex;justify-content:space-between;align-items:center">
+                      <div style="font-size:13px;color:var(--muted)">${escapeHtml(f.name)}</div>
+                      <div style="font-weight:700">${(f.mean_abs_shap || 0).toFixed(4)}</div>
+                    </div>`;
+          });
+          html += "</div>";
+      }
+      
+      // Fallback: raw meta
+      if (!data.kpis && (!data.meta || !data.meta.metrics) && !data.shap) {
+        html += "<div class='muted'>Training finished — no KPI/metric data returned.</div>";
+      }
+
+      setResult("#trainResult", html);
+  }
+  
   function renderMetricList(metrics) {
     if (!metrics) return "";
     let html = "<div style='margin-top:10px;display:flex;gap:8px;flex-wrap:wrap'>";
@@ -293,7 +347,55 @@
   }
 
   // --- Train  ---
+  // --- Train  ---
   const trainForm = el("#trainForm");
+  let trainingInterval = null; 
+
+  function stopPolling() {
+      if (trainingInterval) {
+          clearInterval(trainingInterval);
+          trainingInterval = null;
+          setLoading("#trainBtn", false);
+      }
+  }
+
+  async function startPolling(sid) {
+      if (trainingInterval) return; 
+
+      const pollStatus = async () => {
+          try {
+              const res = await fetch(`/train_status?session_id=${sid}`);
+              if (!res.ok) {
+                  stopPolling();
+                  throw new Error("Failed to fetch training status.");
+              }
+              const data = await res.json();
+              updateSessionId(data.session_id);
+              
+              const progressHtml = renderProgressBar(data.progress, data.message);
+              setResult("#trainResult", progressHtml);
+
+              if (data.status === "completed") {
+                  stopPolling();
+                  renderTrainDashboard(data); 
+                  showToast("Training finished!");
+              } else if (data.status === "failed") {
+                  stopPolling();
+                  showToast("Training failed.");
+              }
+              
+          } catch (err) {
+              stopPolling();
+              console.error("Polling error", err);
+              setResult("#trainResult", `<div class='muted' style='color:var(--danger, #ef4444)'>Training polling failed: ${escapeHtml(err.message || "")}</div>`);
+              showToast("Training polling failed.");
+          }
+      };
+      
+      trainingInterval = setInterval(pollStatus, 1000); 
+      pollStatus(); 
+  }
+
   if (trainForm) {
     trainForm.addEventListener("submit", async (ev) => {
       ev.preventDefault();
@@ -301,58 +403,42 @@
       fd.set("session_id", CURRENT_SID || "");
       const target_col = fd.get("target_col");
       if (!target_col) { showToast("Enter target column name"); return; }
+      
+      stopPolling(); 
 
-      setLoading("#trainBtn", true, "Training...");
+      setLoading("#trainBtn", true, "Starting...");
+      setResult("#trainResult", renderProgressBar(0, "Submitting training job...")); 
+      
       try {
-        const res = await fetch("/train", { method: "POST", body: fd });
-        if (!res.ok) {
-          const t = await res.json().catch(()=>({error:"training failed"}));
-          throw new Error(t.error || "training failed");
-        }
-        const data = await res.json();
-        if (data.session_id) updateSessionId(data.session_id);
+          const res = await fetch("/train", { method: "POST", body: fd });
 
-        //  training dashboard
-        let html = `<div style="margin-bottom:8px"><strong style="color:#fff">Training Dashboard</strong></div>`;
-        if (data.meta && data.meta.n_rows) {
-          html += "<div style='display:flex;gap:10px;flex-wrap:wrap;margin-bottom:8px'>";
-          html += renderKpiCard("Churn rate", ((data.kpis?.churn_rate || 0) * 100).toFixed(2) + "%", "From training labels");
-          html += renderKpiCard("Rows (labelled)", data.meta.n_rows, "Rows used to train");
-          html += "</div>";
-        }
+          if (res.status === 409) { 
+               showToast("Training is already running for this session.");
+               setLoading("#trainBtn", false);
+               startPolling(CURRENT_SID); 
+               return;
+          }
 
-        // meta.metrics if present
-        if (data.meta && data.meta.metrics) {
-          html += `<div style="margin-top:6px"><strong style="color:#fff">Model metrics</strong></div>`;
-          html += renderMetricList(data.meta.metrics);
-        }
+          if (!res.ok) {
+              const t = await res.json().catch(()=>({error:"training failed"}));
+              throw new Error(t.error || "training failed");
+          }
+          
+          const data = await res.json();
+          if (data.session_id) updateSessionId(data.session_id);
+          
+          if (data.status === "training_started") {
+            startPolling(data.session_id || CURRENT_SID);
+          } else {
+            renderTrainDashboard(data);
+            setLoading("#trainBtn", false);
+          }
 
-        // SHAP summary (top features) if returned
-        if (data.shap && data.shap.top_features) {
-          html += `<div style="margin-top:10px"><strong style="color:#fff">Top features (SHAP)</strong></div>`;
-          html += "<div style='margin-top:8px;display:flex;flex-direction:column;gap:6px'>";
-          data.shap.top_features.slice(0,12).forEach(f => {
-            html += `<div style="display:flex;justify-content:space-between;align-items:center">
-                      <div style="font-size:13px;color:var(--muted)">${escapeHtml(f.name)}</div>
-                      <div style="font-weight:700">${(f.mean_abs_shap || 0).toFixed(4)}</div>
-                    </div>`;
-          });
-          html += "</div>";
-        }
-
-        // Fallback: raw meta
-        if (!data.kpis && (!data.meta || !data.meta.metrics) && !data.shap) {
-          html += "<div class='muted'>Training finished — no KPI/metric data returned.</div>";
-        }
-
-        setResult("#trainResult", html);
-        showToast("Training finished");
       } catch (err) {
-        console.error("Train error", err);
-        setResult("#trainResult", "<div class='muted'>Training failed: " + escapeHtml(err.message || "") + "</div>");
-        showToast("Training failed");
-      } finally {
-        setLoading("#trainBtn", false);
+          console.error("Train start error", err);
+          setResult("#trainResult", "<div class='muted'>Training failed to start: " + escapeHtml(err.message || "") + "</div>");
+          setLoading("#trainBtn", false);
+          showToast("Training failed to start.");
       }
     });
   }
@@ -370,7 +456,7 @@
 
       setLoading("#predictBtn", true, "Predicting...");
       try {
-        // Request JSON dashboard first by setting Accept header
+        // Requests JSON dashboard first by setting Accept header
         const res = await fetch("/predict", { method: "POST", body: fd, headers: { "Accept": "application/json" } });
 
         if (!res.ok) {
