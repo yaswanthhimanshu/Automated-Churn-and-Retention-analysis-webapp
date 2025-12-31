@@ -477,9 +477,6 @@ def _fallback_for_open_question(query: str, context: Dict[str, Any]) -> str:
 def respond_to_query(query: str, context: Dict[str, Any], use_llm: bool = False, llm_provider: str = "openai", llm_model: str = "gpt-4o-mini") -> str:
     """
     Main entrypoint for the chatbot.
-    - query: the user text
-    - context: dict with keys 'eda', 'metrics', 'shap', 'simulate'
-    - use_llm: explicit opt-in flag (frontend must set)
     """
     if not query or not isinstance(query, str):
         return "Empty query. Ask about churn, metrics, feature importance, or simulations."
