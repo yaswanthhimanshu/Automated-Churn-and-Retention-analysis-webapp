@@ -14,6 +14,7 @@ import threading
 # local modules
 import core
 import chatbot
+import time_churn_analysis
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -22,7 +23,97 @@ load_dotenv()
 # -----------------------
 # Flask app config
 # -----------------------
+# ===========================================================================
+# JSON serialization  —  production-grade, handles all pandas / numpy types
+# ===========================================================================
+import math as _math
+import numpy as _np
+import pandas as _pd
+from flask.json.provider import DefaultJSONProvider
+
+
+class _SafeJSONProvider(DefaultJSONProvider):
+    """
+    Replaces Flask's default JSON provider globally.
+    Sanitizes the full object tree before json.dumps so NaN/Inf/numpy/pandas
+    types never produce invalid JSON.
+
+    Conversions applied:
+      float NaN / Inf / -Inf          -> null
+      np.floating (any width)         -> float  (NaN/Inf -> null)
+      np.integer  (any width + uint)  -> int
+      np.bool_                        -> bool
+      np.str_                         -> str
+      np.ndarray                      -> list   (recursive)
+      pd.Series                       -> list   (recursive)
+      pd.DataFrame                    -> list-of-dicts  (records orient)
+      pd.Timestamp                    -> ISO-8601 string
+      pd.NA / pd.NaT                  -> null
+      dict                            -> recurse values; keys coerced to str
+      list / tuple                    -> recurse elements
+      anything else                   -> str() fallback, never raises
+    """
+    _np_float    = (_np.floating,)
+    _np_int      = (_np.integer,)
+    _np_bool     = (_np.bool_,)
+    _np_str      = (_np.str_,)
+    _np_ndarray  = _np.ndarray
+    _pd_series   = _pd.Series
+    _pd_df       = _pd.DataFrame
+    _pd_ts       = _pd.Timestamp
+    _pd_na_type  = type(_pd.NA)
+    _pd_nat_type = type(_pd.NaT)
+
+    @classmethod
+    def _sanitize(cls, obj):
+        if obj is None:
+            return None
+        if isinstance(obj, (cls._pd_na_type, cls._pd_nat_type)):
+            return None
+        if isinstance(obj, cls._pd_ts):
+            return obj.isoformat()
+        if isinstance(obj, cls._pd_df):
+            return cls._sanitize(obj.to_dict(orient="records"))
+        if isinstance(obj, cls._pd_series):
+            return cls._sanitize(obj.tolist())
+        if isinstance(obj, cls._np_ndarray):
+            return cls._sanitize(obj.tolist())
+        if isinstance(obj, cls._np_float):
+            v = float(obj)
+            return None if (_math.isnan(v) or _math.isinf(v)) else v
+        if isinstance(obj, cls._np_int):
+            return int(obj)
+        if isinstance(obj, cls._np_bool):
+            return bool(obj)
+        if isinstance(obj, cls._np_str):
+            return str(obj)
+        if isinstance(obj, float):
+            return None if (_math.isnan(obj) or _math.isinf(obj)) else obj
+        if isinstance(obj, (int, str, bool)):
+            return obj
+        if isinstance(obj, dict):
+            return {str(k): cls._sanitize(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [cls._sanitize(v) for v in obj]
+        try:
+            return str(obj)
+        except Exception:
+            return None
+
+    def dumps(self, obj, **kwargs):
+        safe = self._sanitize(obj)
+        kwargs.setdefault("ensure_ascii", self.ensure_ascii)
+        kwargs.setdefault("sort_keys", self.sort_keys)
+        kwargs["allow_nan"] = False
+        return __import__("json").dumps(safe, **kwargs)
+
+
+# ---------------------------------------------------------------------------
 app = Flask(__name__, template_folder="templates", static_folder="static")
+
+# Register safe JSON provider (must be immediately after Flask() init)
+app.json_provider_class = _SafeJSONProvider
+app.json = _SafeJSONProvider(app)
 app.config['MAX_CONTENT_LENGTH'] = 250 * 1024 * 1024  # 250 MB
 app.secret_key = uuid.uuid4().hex
 
@@ -54,6 +145,7 @@ def new_session():
 
         "train_progress": 0,
         "train_status_msg": "Idle",
+        "model_history": [],      # stores last 5 trained model metric summaries
     }
     return sid
 
@@ -239,6 +331,14 @@ def train():
         compute_cv = (request.form.get("compute_cv") or "false").lower() in ("1", "true", "yes", "y")
         tune_model = (request.form.get("tune_model") or "false").lower() in ("1", "true", "yes", "y")
 
+        # --- Column selection: drop user-chosen columns ONLY from the training copy ---
+        # Original session df is NEVER modified — EDA/chat/analysis/lifecycle stay intact.
+        raw_drop = request.form.get("columns_to_drop", "")
+        columns_to_drop = [c.strip() for c in raw_drop.split(",") if c.strip()] if raw_drop.strip() else []
+        columns_to_drop = [c for c in columns_to_drop if c != target_col]  # never drop target
+        df_train = df.drop(columns=columns_to_drop, errors="ignore").copy()
+        session["columns_to_drop"] = columns_to_drop  # saved so /predict can align features
+
 
         def train_task(sid, df, target_col, model_type, sample_ratio, mode, compute_cv, tune_model):
             """Wrapper function to run the training and update session."""
@@ -274,6 +374,26 @@ def train():
                 s["model"] = model_obj
                 s["metrics"] = meta.get("metrics") if isinstance(meta, dict) else None
                 s["meta"] = meta
+
+                # Append to model history (last 5 only, metrics only)
+                _m = meta.get("metrics") or {}
+                _entry = {
+                    "model_type": model_type,
+                    "accuracy":   round(float(_m.get("accuracy",  0) or 0), 4),
+                    "precision":  round(float(_m.get("precision", 0) or 0), 4),
+                    "recall":     round(float(_m.get("recall",    0) or 0), 4),
+                    "f1":         round(float(_m.get("f1",        0) or 0), 4),
+                    "roc_auc":    round(float(_m["roc_auc"]), 4) if _m.get("roc_auc") is not None else None,
+                    "trained_on": meta.get("trained_on", ""),
+                    "n_rows":     meta.get("n_rows"),
+                    "train_score": round(float(meta.get("train_score") or 0), 4) if meta.get("train_score") is not None else None,
+                    "test_score":  round(float(meta.get("test_score")  or 0), 4) if meta.get("test_score")  is not None else None,
+                    "fit_status":  meta.get("fit_status", ""),
+                    "fit_reason":  meta.get("fit_reason", ""),
+                }
+                history = s.get("model_history") or []
+                history.append(_entry)
+                s["model_history"] = history[-5:]
                 
                 progress_callback(95, "Computing SHAP summary...")
                 time.sleep(0.5)
@@ -297,7 +417,7 @@ def train():
 
         thread = threading.Thread(
             target=train_task, 
-            args=(sid, df.copy(), target_col, model_type, sample_ratio, mode, compute_cv, tune_model)
+            args=(sid, df_train, target_col, model_type, sample_ratio, mode, compute_cv, tune_model)
         )
         thread.start()
         
@@ -325,54 +445,277 @@ def predict():
             return _json_error("no trained model")
 
         # prefers uploaded file for scoring, else use session df
-        df_pred = None
+        df_raw = None
         if "file" in request.files:
             try:
-                df_pred = core.safe_read_csv_bytes(request.files["file"].read())
+                df_raw = core.safe_read_csv_bytes(request.files["file"].read())
             except Exception:
-                df_pred = None
-        if df_pred is None:
-            df_pred = session.get("df")
-        if df_pred is None:
+                df_raw = None
+        if df_raw is None:
+            df_raw = session.get("df")
+        if df_raw is None:
             return _json_error("no data available for prediction")
 
-        predictions_df = core.predict_df(model_obj, df_pred.copy())
-        session["predictions"] = predictions_df
+        # Keep original df intact; drop identifier columns only for model input
+        df_original = df_raw.copy()
+        _cols_drop = session.get("columns_to_drop") or []
+        df_for_model = df_raw.drop(columns=_cols_drop, errors="ignore").copy() if _cols_drop else df_raw.copy()
+
+        # Run predictions on the feature-aligned copy
+        pred_out = core.predict_df(model_obj, df_for_model)
+
+        # Attach predictions back to the ORIGINAL dataframe (all original columns preserved)
+        df_original["churn_probability"] = pred_out["churn_probability"].values
+        df_original["predicted_churn"]   = pred_out["predicted_churn"].values
+
+        session["predictions"] = df_original
+
+        # Risk segment counts from FULL dataset
+        probs = df_original["churn_probability"]
+        risk_counts = {
+            "high":   int((probs >= 0.7).sum()),
+            "medium": int(((probs >= 0.35) & (probs < 0.7)).sum()),
+            "low":    int((probs < 0.35).sum()),
+        }
 
         # Determined preview mode:
         accept = request.headers.get("Accept", "")
         preview_flag = (request.form.get("preview") or request.args.get("preview") or "").lower() in ("1", "true", "yes", "y")
         if "application/json" in accept or "text/html" in accept or preview_flag:
-            preview_html = core.preview_df_html(predictions_df.head(200), max_rows=200, max_cols=50)
-            churn_rate = float(predictions_df["predicted_churn"].mean())
+            churn_rate = float(df_original["predicted_churn"].mean())
             revenue_col = None
             for candidate in ("Revenue", "Total Spend", "ARPU", "ARPC", "TotalSpend", "Revenue_USD", "revenue"):
-                if candidate in predictions_df.columns:
+                if candidate in df_original.columns:
                     revenue_col = candidate
                     break
             revenue_summary = None
             if revenue_col:
                 try:
                     revenue_summary = {
-                        "avg_revenue": float(predictions_df[revenue_col].mean()),
-                        "sum_revenue": float(predictions_df[revenue_col].sum())
+                        "avg_revenue": float(df_original[revenue_col].mean()),
+                        "sum_revenue": float(df_original[revenue_col].sum())
                     }
                 except Exception:
                     revenue_summary = None
-            # simple KPI cards and sample rows for frontend dashboard
+
+            # Top 100 rows sorted by churn_probability for the UI preview
+            rows_sample = (
+                df_original
+                .sort_values("churn_probability", ascending=False)
+                .head(100)
+                .to_dict(orient="records")
+            )
+            # Full dataset — ALL rows in original order for download and analysis
+            full_data = df_original.to_dict(orient="records")
+
             return jsonify({
-                "preview_html": preview_html,
-                "n_rows": int(len(predictions_df)),
+                "n_rows": int(len(df_original)),
                 "churn_rate": churn_rate,
                 "revenue_summary": revenue_summary,
-                "rows_sample": predictions_df.head(200).to_dict(orient="records"),
+                "risk_counts": risk_counts,
+                "rows_sample": rows_sample,
+                "full_data": full_data,
                 "session_id": sid
             })
-        return _make_csv_response(predictions_df)
+        return _make_csv_response(df_original)
     except Exception as e:
         traceback.print_exc()
         return _json_error(f"prediction failed: {str(e)}", 500)
+
+@app.route("/time_churn_detect", methods=["POST"])
+def time_churn_detect():
+    try:
+        sid_in = request.form.get("session_id") or request.args.get("session_id")
+        sid, session = ensure_session(sid_in)
+
+        if not session or session.get("df") is None:
+            return _json_error("invalid session or no dataset")
+
+        df = session["df"]
+
+        candidates = time_churn_analysis.detect_time_candidates(df)
+
+        return jsonify({
+            "candidates": candidates,
+            "session_id": sid
+        })
+
+    except Exception as e:
+        traceback.print_exc()
+        return _json_error(f"time churn detection failed: {str(e)}", 500)
+
+@app.route("/get_unique_values", methods=["POST"])
+def get_unique_values():
+    try:
+        sid_in = request.form.get("session_id") or request.args.get("session_id")
+        sid, session = ensure_session(sid_in)
+
+        if not session or session.get("df") is None:
+            return _json_error("invalid session or no dataset")
+
+        df = session["df"]
+        column = request.form.get("column")
+
+        if not column:
+            return _json_error("missing column")
+
+        values = time_churn_analysis.get_column_unique_values(df, column)
+
+        return jsonify({
+            "column": column,
+            "values": values,
+            "session_id": sid
+        })
+
+    except Exception as e:
+        traceback.print_exc()
+        return _json_error(f"failed to get unique values: {str(e)}", 500)
+
+
+@app.route("/time_churn", methods=["POST"])
+def time_churn():
+    try:
+        sid_in = request.form.get("session_id") or request.args.get("session_id")
+        sid, session = ensure_session(sid_in)
+
+        if not session or session.get("df") is None:
+            return _json_error("invalid session or no dataset")
+
+        df = session["df"]
+
+        time_column = request.form.get("time_column")
+        analysis_type = request.form.get("analysis_type")
+
+        if not time_column:
+            return _json_error("missing time_column")
+
+        user_value = None
+
+        if pd.api.types.is_numeric_dtype(df[time_column]):
+
+            if analysis_type == "range":
+                min_val = request.form.get("min_value")
+                max_val = request.form.get("max_value")
+
+                try:
+                    min_val = float(min_val)
+                    max_val = float(max_val)
+                except Exception:
+                    return _json_error("invalid range values")
+
+                if min_val > max_val:
+                    return _json_error("min_value must be smaller than max_value")
+
+                user_value = [min_val, max_val]
+
+            else:
+                val = request.form.get("user_value")
+
+                try:
+                    user_value = float(val)
+                except Exception:
+                    return _json_error("invalid numeric value")
+
+        else:
+            val = request.form.get("user_value")
+
+            if not val:
+                return _json_error("missing value for selected column")
+
+            user_value = [v.strip() for v in val.split(",") if v.strip()]
+
+        target_col = None
+
+        if session.get("model") and hasattr(session["model"], "target_col"):
+            target_col = session["model"].target_col
+        else:
+            return _json_error("target column not available (train model first)")
+
+        predictions_df = session.get("predictions")
+        if pd.api.types.is_numeric_dtype(df[time_column]):
+            inferred_type = "duration"
+        else:
+            inferred_type = "period"
+
+        result = time_churn_analysis.analyze_time_churn(
+            df=df,
+            target_col=target_col,
+            time_column=time_column,
+            time_type=inferred_type,
+            user_value=user_value,
+            predictions_df=predictions_df
+        )
+
+        lifecycle = time_churn_analysis.lifecycle_risk_analysis(
+            df=df,
+            target_col=target_col,
+            predictions_df=predictions_df
+        )
+        session["lifecycle_risk"] = lifecycle
+
+        return jsonify({
+            "time_churn": result,
+            "lifecycle_risk": lifecycle,
+            "session_id": sid
+        })
+
+    except Exception as e:
+        traceback.print_exc()
+        return _json_error(f"time churn analysis failed: {str(e)}", 500)
+
+@app.route("/lifecycle_risk", methods=["POST"])
+def lifecycle_risk():
+    try:
+        sid_in = request.form.get("session_id") or request.args.get("session_id")
+        sid, session = ensure_session(sid_in)
+
+        if not session or session.get("df") is None:
+            return _json_error("invalid session or no dataset")
+
+        df = session["df"]
+
+        # Get target column from trained model
+        target_col = None
+        if session.get("model") and hasattr(session["model"], "target_col"):
+            target_col = session["model"].target_col
+        else:
+            return _json_error("target column not available (train model first)")
+
+        predictions_df = session.get("predictions")
+
+        result = time_churn_analysis.lifecycle_risk_analysis(
+            df=df,
+            target_col=target_col,
+            predictions_df=predictions_df
+        )
+
+        if result is None:
+            return _json_error("No duration-like column detected")
+
+        session["lifecycle_risk"] = result
+
+        return jsonify({
+            "lifecycle_risk": result,
+            "session_id": sid
+        })
+
+    except Exception as e:
+        traceback.print_exc()
+        return _json_error(f"lifecycle risk analysis failed: {str(e)}", 500)
+
     
+# -----------------------
+# Model History
+# -----------------------
+@app.route("/model_history", methods=["GET"])
+def model_history():
+    sid_in = request.args.get("session_id")
+    sid, session = ensure_session(sid_in)
+    return jsonify({
+        "history": session.get("model_history") or [],
+        "session_id": sid
+    })
+
 # -----------------------
 # Training Status Route 
 # -----------------------
@@ -500,7 +843,10 @@ def simulate():
                     return _json_error(f"invalid {key}")
 
         cost_per_customer = float(request.form.get("cost_per_customer", 0))
-        result = core.simulate_action_with_roi(model_obj, df, action, cost_per_customer)
+        # Drop columns excluded at training time so features match the model
+        _sim_drop = session.get("columns_to_drop") or []
+        df_sim = df.drop(columns=_sim_drop, errors="ignore").copy() if _sim_drop else df
+        result = core.simulate_action_with_roi(model_obj, df_sim, action, cost_per_customer)
         session["simulate_result"] = result
         return jsonify({"simulate": result, "session_id": sid})
     except Exception as e:

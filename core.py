@@ -1,28 +1,29 @@
 #core.py 
 
-
+""" These are Python utility modules. They help with type hints, file handling, warnings, error tracking, and time-based operations."""
 from typing import Tuple, Dict, Any, Optional
 import io
 import warnings
 import traceback
-import time
+import time  
 
+"""These libraries are used for reading datasets and numerical processing."""
 import chardet
 import pandas as pd
 import numpy as np
 
-from sklearn.model_selection import train_test_split, cross_val_score, GridSearchCV
-from sklearn.preprocessing import StandardScaler
-from sklearn.impute import SimpleImputer
-from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, AdaBoostClassifier
-from sklearn.tree import DecisionTreeClassifier
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
-from sklearn.naive_bayes import GaussianNB
-from sklearn.neighbors import KNeighborsClassifier
-from sklearn.svm import SVC
+
+from sklearn.model_selection import train_test_split, cross_val_score, GridSearchCV #These functions are used to split data into training and testing sets and to evaluate models.
+from sklearn.preprocessing import StandardScaler #This class is used for scaling features to have mean=0 and variance=1.
+from sklearn.impute import SimpleImputer #This class is used for imputing missing values in a dataset.
+from sklearn.linear_model import LogisticRegression #This class is used for implementing logistic regression models.
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, AdaBoostClassifier #These classes are used for implementing ensemble learning algorithms.
+from sklearn.tree import DecisionTreeClassifier #This class is used for implementing decision tree algorithms.
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score #These functions are used for evaluating the performance of machine learning models.
+from sklearn.naive_bayes import GaussianNB #This class is used for implementing Gaussian Naive Bayes algorithm.
 
 # shap import 
+"""This attempts to import the shap library, which is used for SHapley Additive exPlanations. It also handles the case where the library is not available."""
 try:
     import shap  
     SHAP_AVAILABLE = True
@@ -31,26 +32,34 @@ except Exception:
     shap = None
     SHAP_AVAILABLE = False
 
-# heavy libraries 
+# heavy libraries import 
 try:
-    from xgboost import XGBClassifier  
+    from xgboost import XGBClassifier  #This attempts to import the XGBClassifier from the xgboost library, which is used for eXtreme Gradient Boosting. It also handles the case where the library is not available.
 except Exception:
-    XGBClassifier = None
+    XGBClassifier = None # This sets the XGBClassifier variable to None if the import fails. This is likely done to handle the case where the library is not available, and to prevent the program from crashing. If we don't set it to none, the program may raise an error when trying to use the XGBClassifier variable later on.
 
 try:
-    from catboost import CatBoostClassifier  
+    from catboost import CatBoostClassifier  #This attempts to import the CatBoostClassifier from the catboost library, which is used for CatBoost algorithm.
 except Exception:
-    CatBoostClassifier = None
+    CatBoostClassifier = None  # This sets the CatBoostClassifier variable to None if the import fails. This is likely done to handle the case where the library is not available, and to prevent the program from crashing. If we don't set it to none, the program may raise an error when trying to use the CatBoostClassifier variable later on.
+
+# ---------------------------
+# Global prediction threshold
+# ---------------------------
+# Lower than 0.5 to improve recall on imbalanced churn data
+DEFAULT_THRESHOLD: float = 0.35
 
 # ---------------------------
 # Safe file reading (CSV/XLSX)
 # ---------------------------
+""" This function safely reads an uploaded file (CSV or Excel) and converts it into a pandas DataFrame without crashing due to encoding or format issues. """
+
 def safe_read_csv_bytes(raw_bytes: bytes) -> Optional[pd.DataFrame]:
     try:
         if raw_bytes is None:
             return None
 
-        # Quick XLSX detection (PK..)
+        # This block detects Excel files by checking their ZIP file signature. Since .xlsx files are internally ZIP archives, they start with the ‘PK’ signature. Excel files are read using pandas’ read_excel, which does not require manual encoding handling. If reading fails, the system falls back to CSV parsing.
         if isinstance(raw_bytes, (bytes, bytearray)) and raw_bytes[:4] == b'PK\x03\x04':
             try:
                 df = pd.read_excel(io.BytesIO(raw_bytes))
@@ -60,18 +69,21 @@ def safe_read_csv_bytes(raw_bytes: bytes) -> Optional[pd.DataFrame]:
                 # fall back to CSV parsing
                 pass
 
+        # This uses the chardet library to estimate the CSV file’s encoding. The detected encoding is prioritized, and additional common encodings like UTF-8 and Latin-1 are added as fallbacks. This prepares the system to handle files from different operating systems and software sources.
+        # The system first uses the chardet library to guess the encoding of the CSV file. That guessed encoding is tried first. If that doesn’t work, the system tries a list of common encodings as fallbacks
         guess = chardet.detect(raw_bytes or b"")
-        detected = guess.get("encoding") or ""
-        candidates = [detected] if detected else []
-        candidates += ["utf-8-sig", "utf-8", "cp1252", "latin1"]
-
-        last_exc = None
+        detected = guess.get("encoding") or "" 
+        candidates = [detected] if detected else [] # 
+        candidates += ["utf-8-sig", "utf-8", "cp1252", "latin1"]  
+        
+        # If chardet fails to detect encoding, fallback encodings are tried one by one; if it detects an encoding, it is placed first in the candidate list and the loop tries encodings in order until one works. If all else fails, it returns None.
+        last_exc = None 
         for enc in candidates:
             if not enc:
                 continue
             try:
                 text = raw_bytes.decode(enc)
-                df = pd.read_csv(io.StringIO(text), low_memory=False)
+                df = pd.read_csv(io.StringIO(text), low_memory=False) 
                 df._detected_encoding = enc
                 return df
             except Exception as e:
@@ -110,28 +122,28 @@ def preview_df_html(df: pd.DataFrame, max_rows: int = 1000, max_cols: int = 1000
 # ---------------------------
 def quick_eda(df: pd.DataFrame) -> Dict[str, Any]:
     info: Dict[str, Any] = {}
-    info["n_rows"], info["n_cols"] = int(df.shape[0]), int(df.shape[1])
-    cols = []
+    info["n_rows"], info["n_cols"] = int(df.shape[0]), int(df.shape[1]) # Get the number of rows and columns in the DataFrame
+    cols = [] 
     for c in df.columns:
         dtype = str(df[c].dtype)
         missing = int(df[c].isna().sum())
         cols.append({"name": c, "dtype": dtype, "missing": missing})
     info["columns"] = cols
-    info["missing_total"] = int(df.isna().sum().sum())
-    info["numeric_cols"] = [c for c in df.select_dtypes(include=[np.number]).columns.tolist()]
-    info["categorical_cols"] = [c for c in df.columns if c not in info["numeric_cols"]]
+    info["missing_total"] = int(df.isna().sum().sum()) # Calculate the total number of missing values in the DataFrame
+    info["numeric_cols"] = [c for c in df.select_dtypes(include=[np.number]).columns.tolist()] # Get the list of numeric columns in the DataFrame
+    info["categorical_cols"] = [c for c in df.columns if c not in info["numeric_cols"]] # Get the list of categorical columns in the DataFrame
     return info
 
 def generate_full_report(df: pd.DataFrame, sample_limit: int = 50000) -> Dict[str, Any]:
     n = len(df)
-    sample = df.sample(n=sample_limit, random_state=42) if n > sample_limit else df.copy()
-    report = quick_eda(sample)
+    sample = df.sample(n=sample_limit, random_state=42) if n > sample_limit else df.copy() # Sample the data if it's larger than the limit
+    report = quick_eda(sample) # Generate quick EDA report for the sampled data
     numeric_cols = report["numeric_cols"]
     if numeric_cols:
         try:
-            report["correlation"] = sample[numeric_cols].corr().round(3).to_dict()
+            report["correlation"] = sample[numeric_cols].corr().round(3).to_dict() # Calculate the correlation matrix for numeric columns and convert it to a dictionary
         except Exception:
-            report["correlation"] = {}
+            report["correlation"] = {} 
         try:
             report["numeric_summary"] = sample[numeric_cols].describe().round(3).to_dict()
         except Exception:
@@ -294,6 +306,21 @@ def _compute_metrics(y_true, y_pred, y_proba=None) -> Dict[str, Any]:
     return out
 
 # ---------------------------
+# Best metric selector
+# ---------------------------
+def select_best_metric(metrics: Dict[str, Any]) -> str:
+    """Return the key of the most informative metric available.
+    Priority: ROC-AUC > F1 > Accuracy.
+    """
+    if metrics.get("roc_auc") is not None:
+        return "roc_auc"
+    elif metrics.get("f1") is not None:
+        return "f1"
+    else:
+        return "accuracy"
+
+
+# ---------------------------
 # Train model 
 # ---------------------------
 def train_model(df: pd.DataFrame,
@@ -392,17 +419,66 @@ def train_model(df: pd.DataFrame,
             progress_callback(80, "Computing metrics...")
             time.sleep(0.5)
 
+        # Use DEFAULT_THRESHOLD — consistent with predict_df() for accurate recall
         try:
-            y_pred = estimator.predict(X_test)
-        except Exception:
-            y_pred = np.zeros_like(y_test)
-        try:
-            y_proba = estimator.predict_proba(X_test)
+            y_proba = estimator.predict_proba(X_test)  # full 2-col array for roc_auc
+            y_pred  = (y_proba[:, 1] >= DEFAULT_THRESHOLD).astype(int)
         except Exception:
             y_proba = None
+            y_pred  = estimator.predict(X_test)        # fallback if no predict_proba
 
         metrics = _compute_metrics(y_test, y_pred, y_proba)
-        
+
+        # ----------------------------------------------------------
+        # Overfitting / underfitting detection
+        # Compute train score using the same metric (prefer F1).
+        # Only meaningful in split mode; full mode has no holdout.
+        # ----------------------------------------------------------
+        fit_status: str = "N/A"
+        fit_reason: str = "No holdout set — trained on full data"
+        train_score: float = 0.0
+        test_score: float = 0.0
+
+        if mode == "split":
+            try:
+                y_proba_tr = estimator.predict_proba(X_train)
+                y_pred_tr  = (y_proba_tr[:, 1] >= DEFAULT_THRESHOLD).astype(int)
+            except Exception:
+                y_pred_tr = estimator.predict(X_train)
+
+            train_metrics = _compute_metrics(y_train, y_pred_tr)
+
+            # Prefer F1; fall back to accuracy
+            train_score = float(
+                train_metrics["f1"] if train_metrics.get("f1") is not None
+                else train_metrics.get("accuracy", 0.0)
+            )
+            test_score = float(
+                metrics["f1"] if metrics.get("f1") is not None
+                else metrics.get("accuracy", 0.0)
+            )
+
+            gap = train_score - test_score
+
+            if train_score < 0.6 and test_score < 0.6:
+                fit_status = "Underfitting"
+                fit_reason = "Model performs poorly on both training and test data"
+            elif gap > 0.15:
+                fit_status = "Severe Overfitting"
+                fit_reason = "Large gap between training and test performance"
+            elif gap > 0.08:
+                fit_status = "Overfitting"
+                fit_reason = "Model performs significantly better on training data"
+            elif gap > 0.03:
+                fit_status = "Mild Overfitting"
+                fit_reason = "Small gap between training and test performance"
+            elif test_score > 0.75:
+                fit_status = "Good Fit"
+                fit_reason = "Strong and balanced generalization"
+            else:
+                fit_status = "Acceptable"
+                fit_reason = "Moderate performance with reasonable generalization"
+
         if compute_cv and mode == "split":
             try:
                 cv_scores = cross_val_score(estimator, X_train, y_train, cv=min(cv_folds, 5), scoring="accuracy", n_jobs=-1)
@@ -416,25 +492,41 @@ def train_model(df: pd.DataFrame,
         model_obj.imputer = imputer
         model_obj.scaler = scaler
         model_obj.target_col = target_col
+        # Store exact feature columns used at fit time — used to align predict/explain
+        model_obj.feature_columns = df_clean.drop(columns=[target_col]).columns.tolist()
 
         model_id = f"{model_type}_{int(np.random.randint(1000, 9999))}"
         
+        best_metric = select_best_metric(metrics)
+
         if mode == "split":
             meta = {
                 "status": "success",
                 "trained_on": "split",
                 "test_size": float(sample_ratio or 0.2),
                 "metrics": metrics,
+                "best_metric": best_metric,
+                "best_score": metrics.get(best_metric),
                 "n_train": int(len(y_train)),
-                "n_test": int(len(y_test)), 
-                "n_rows": int(len(y_train))
+                "n_test": int(len(y_test)),
+                "n_rows": int(len(y_train)),
+                "train_score": round(train_score, 4),
+                "test_score": round(test_score, 4),
+                "fit_status": fit_status,
+                "fit_reason": fit_reason,
             }
         else:
-             meta = {
+            meta = {
                 "status": "success",
                 "trained_on": "full",
                 "metrics": metrics,
-                "n_rows": int(len(y_all))
+                "best_metric": best_metric,
+                "best_score": metrics.get(best_metric),
+                "n_rows": int(len(y_all)),
+                "train_score": None,
+                "test_score": None,
+                "fit_status": "N/A",
+                "fit_reason": "No holdout set — trained on full data",
             }
              
         if progress_callback: # <--- FINAL SUCCESS REPORT
@@ -458,6 +550,10 @@ def predict_df(model: Any, df: pd.DataFrame) -> pd.DataFrame:
         df_proc = df_copy.drop(columns=[model.target_col])
     else:
         df_proc = df_copy
+
+    # Align to training columns: drops unseen columns, fills missing ones with 0
+    if hasattr(model, "feature_columns"):
+        df_proc = df_proc.reindex(columns=model.feature_columns, fill_value=0)
 
     # Transform with the encoders (unknown -> -1)
     X_enc = _transform_with_encoders(df_proc, model.encoders or {})
@@ -491,17 +587,8 @@ def predict_df(model: Any, df: pd.DataFrame) -> pd.DataFrame:
 
     out = df_copy.copy()
     out["churn_probability"] = np.clip(np.asarray(probs, dtype=float), 0.0, 1.0)
-    try:
-        out["predicted_churn"] = np.where(np.asarray(preds, dtype=float) >= 0.5, 1, 0).astype(int)
-    except Exception:
-        mapped = []
-        for v in preds:
-            try:
-                mapped.append(int(v))
-            except Exception:
-                sv = str(v).strip().lower()
-                mapped.append(1 if sv in ("1", "yes", "true", "y", "churn") else 0)
-        out["predicted_churn"] = np.asarray(mapped, dtype=int)
+    # Apply DEFAULT_THRESHOLD — consistent with training evaluation
+    out["predicted_churn"] = (out["churn_probability"] >= DEFAULT_THRESHOLD).astype(int)
 
     return out
 
@@ -569,6 +656,9 @@ def explain_row(model: Any, row_df: pd.DataFrame) -> Dict[str, Any]:
         df_proc = row_df.copy()
         if model.target_col in df_proc.columns:
             df_proc = df_proc.drop(columns=[model.target_col])
+        # Align to training columns: drops unseen columns, fills missing ones with 0
+        if hasattr(model, "feature_columns"):
+            df_proc = df_proc.reindex(columns=model.feature_columns, fill_value=0)
         X_enc = _transform_with_encoders(df_proc, model.encoders)
         X_imputed = model.imputer.transform(X_enc)
         X_scaled = model.scaler.transform(X_imputed)

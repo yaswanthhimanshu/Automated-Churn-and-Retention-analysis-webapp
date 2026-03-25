@@ -23,7 +23,7 @@
     nav.nav a{color:var(--muted);text-decoration:none;padding:8px 12px;border-radius:10px;font-size:14px}
     nav.nav a:hover{background:var(--glass);color:#fff}
     .session-badge{background:rgba(255,255,255,0.03);padding:8px 10px;border-radius:10px;color:var(--muted);font-size:13px}
-    main{margin-top:18px;display:grid;grid-template-columns:1fr;gap:18px}
+    main{margin-top:18px;display:flex;flex-direction:column;}
     .panel{background:linear-gradient(180deg, rgba(0, 0, 0, 0.02), rgba(255,255,255,0.01));border-radius:var(--radius);padding:18px;box-shadow:0 6px 18px rgba(2,6,23,0.5);border:1px solid rgba(255,255,255,0.03)}
     .panel h2{margin:0 0 12px 0;font-size:18px;color:#fff}
     .muted{color:var(--muted);font-size:13px}
@@ -76,7 +76,7 @@
 
     <main>
       <!-- Intro / Overview Panel -->
-      <section class="panel" style="text-align:center;background:rgba(255,255,255,0.02)">
+      <section id="intro" class="panel" style="text-align:center;background:rgba(255,255,255,0.02)">
         <h2 style="color:#fff;margin-bottom:8px;">Welcome to Churn-Retention-Analysis</h2>
         <p class="small muted" style="max-width:720px;margin:auto;line-height:1.6">
           Churn-Retention-analysis is an AI-powered churn analysis and retention platform. 
@@ -106,24 +106,22 @@
         </div>
       </section>
 
-      <!-- EDA + Train side-by-side -->
-      <section id="eda-train" class="grid-2">
-        <!-- Quick EDA -->
-        <div class="panel" id="eda">
-          <h2>2. Quick EDA</h2>
-          <p class="small muted">Summary of uploaded data (rows, columns, missing values). Click "Run Full EDA" for a deeper report.</p>
-          <div id="edaSummary" class="result">
-            <div class="muted">Upload a dataset to see EDA summary.</div>
-          </div>
-          <div style="margin-top:12px" class="row">
-            <button id="fullEdaBtn" class="ghost" type="button">Run Full EDA</button>
-            <button id="downloadPreviewBtn" class="ghost" type="button">Download Preview</button>
-          </div>
-          <div id="edaFullResult" class="result" style="margin-top:12px"></div>
+      <!-- Quick EDA -->
+      <section id="eda" class="panel">
+        <h2>2. Quick EDA</h2>
+        <p class="small muted">Summary of uploaded data (rows, columns, missing values). Click "Run Full EDA" for a deeper report.</p>
+        <div id="edaSummary" class="result">
+          <div class="muted">Upload a dataset to see EDA summary.</div>
         </div>
+        <div style="margin-top:12px" class="row">
+          <button id="fullEdaBtn" class="ghost" type="button">Run Full EDA</button>
+          <button id="downloadPreviewBtn" class="ghost" type="button">Download Preview</button>
+        </div>
+        <div id="edaFullResult" class="result" style="margin-top:12px"></div>
+      </section>
 
-        <!-- Train -->
-        <div class="panel" id="train">
+      <!-- Train -->
+      <section id="train" class="panel">
           <h2>3. Train model</h2>
           <p class="small muted">Select target column and model. Use fast mode for quick iteration.</p>
           <form id="trainForm" novalidate>
@@ -164,7 +162,7 @@
               </label>
               <label style="display:flex;align-items:center;gap:8px">
                 <input type="checkbox" id="computeCv" name="compute_cv" aria-label="Compute cross-validation estimate">
-                <div class="small muted">Compute CV (full mode only)</div>
+                <div class="small muted">Compute CV (split mode only)</div>
               </label>
             </div>
 
@@ -181,9 +179,13 @@
             </div>
           </form>
 
-          <div id="trainResult" class="result small"></div>
-          <div style="margin-top:10px" id="modelMetrics" class="small muted"></div>
-        </div>
+        <div id="trainResult" class="result small"></div>
+        <div style="margin-top:10px" id="modelMetrics" class="small muted"></div>
+      </section>
+
+      <!-- Model Comparison Table (shown after 2+ models trained) -->
+      <section id="modelComparisonPanel" class="panel" style="display:none">
+        <!-- populated by renderModelComparisonTable() in main.js -->
       </section>
 
       <!-- Predict / Explain -->
@@ -201,7 +203,19 @@
               <button id="predictBtn" class="primary" type="submit">Run Prediction</button>
             </div>
           </form>
+          <p class="small muted" style="margin-top:6px">Showing top 100 rows sorted by churn probability. Use "Expand Full View" for all results.</p>
           <div id="predictResult" class="result small muted">No predictions yet.</div>
+        </div>
+
+        <!-- Prediction Full-View Modal -->
+        <div id="predictModal" style="display:none" class="pred-modal-overlay" role="dialog" aria-modal="true" aria-label="Full prediction view">
+          <div class="pred-modal-box">
+            <div class="pred-modal-header">
+              <strong style="color:var(--text)">Full Prediction View</strong>
+              <button id="predictModalClose" class="ghost small" type="button">✕ Close</button>
+            </div>
+            <div id="predictModalBody" class="pred-modal-body"></div>
+          </div>
         </div>
 
         <div class="panel" id="explain">
@@ -228,6 +242,69 @@
           <div id="explainResult" class="result small muted">No explanation yet.</div>
         </div>
       </section>
+
+      <!-- Segment-based Churn Analysis -->
+      <section id="timeChurn" class="panel">
+        <h3>Segment-based Churn Analysis</h3>
+
+        <p class="small muted" style="margin-bottom:12px">
+          Analyze customer churn by selecting a specific column and filtering values. 
+          You can evaluate a single category or define a range to understand churn behavior across segments.
+        </p>
+
+        <form id="timeChurnForm">
+          <input type="hidden" name="session_id" value="{{ session_id }}" />
+
+          <!-- Column Selection -->
+          <div class="form-row">
+            <label style="flex:1">
+              <div class="small muted">Select column for analysis</div>
+              <select id="timeColumnSelect" required></select>
+            </label>
+          </div>
+
+          <!-- Analysis Type -->
+          <div class="form-row radio-row">
+            <label class="small">
+              <input type="radio" name="analysisType" value="single" checked />
+              Analyze a single value
+            </label>
+
+            <label class="small">
+              <input type="radio" name="analysisType" value="range" />
+              Analyze a value range
+            </label>
+          </div>
+
+          <!-- Single Value -->
+          <div id="timeValueContainer" class="form-row">
+            <!-- Dynamic dropdown will be inserted here -->
+          </div>
+
+          <!-- Range Inputs -->
+          <div id="rangeInputs" class="form-row" style="display:none; gap:10px;">
+            <label style="flex:1">
+              <div class="small muted">From (minimum value)</div>
+              <input id="minValue" type="number" placeholder="Enter minimum value" />
+            </label>
+
+            <label style="flex:1">
+              <div class="small muted">To (maximum value)</div>
+              <input id="maxValue" type="number" placeholder="Enter maximum value" />
+            </label>
+          </div>
+
+          <!-- Submit -->
+          <div class="form-row">
+            <button id="timeChurnBtn" class="primary" type="submit">
+              Run Analysis
+            </button>
+          </div>
+        </form>
+
+        <div id="timeChurnResult" style="margin-top:14px"></div>
+      </section>
+
 
       <!-- Simulation -->
       <section id="simulate" class="panel">
@@ -295,6 +372,18 @@
     </main>
   </div>
 
+  <!-- Modal close logic -->
+  <script>
+    document.addEventListener("click", function(e) {
+      if (e.target && e.target.id === "predictModalClose") {
+        const m = document.getElementById("predictModal");
+        if (m) m.style.display = "none";
+      }
+      if (e.target && e.target.id === "predictModal") {
+        e.target.style.display = "none";
+      }
+    });
+  </script>
   <!-- hook java script  -->
   <script src="{{ url_for('static', filename='charts.js') }}"></script>
   <script src="{{ url_for('static', filename='main.js') }}"></script>
