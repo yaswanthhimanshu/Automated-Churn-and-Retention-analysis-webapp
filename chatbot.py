@@ -3,6 +3,7 @@ from typing import Dict, Any, List, Tuple
 import re
 import difflib
 import os
+import json
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 try:
     from sklearn.feature_extraction.text import TfidfVectorizer
@@ -182,6 +183,8 @@ def _is_concept_query(query: str) -> bool:
         "churn rate", "is my", "is our",
         "current churn", "what is the churn", "churn by", "by segment",
         "model choice", "why this model", "why model",
+        "best model", "best algorithm", "which model", "which algorithm",
+        "model should", "algorithm should", "should i use",
     )
     if any(marker in q for marker in data_markers):
         return False
@@ -194,9 +197,22 @@ def _is_concept_query(query: str) -> bool:
         return True
     concept_markers = (
         "what is", "what does", "define", "definition", "meaning",
-        "means", "mean", "explain",
+        "means", "mean", "explain", "tell me about",
     )
     return any(marker in q for marker in concept_markers) and any(term in q for term in concept_terms)
+def _is_full_summary_query(query: str) -> bool:
+    q = _normalize(query)
+    return any(marker in q for marker in ("show all", "full summary", "complete analysis", "all results", "everything", "overview"))
+def _is_model_advice_query(query: str) -> bool:
+    q = _normalize(query)
+    advice_markers = (
+        "which model is best", "what model is best", "best model for",
+        "which algorithm is best", "what algorithm is best", "best algorithm for",
+        "what model should", "which model should", "what algorithm should",
+        "which algorithm should", "model should i use", "algorithm should i use",
+        "best model to", "best algorithm to",
+    )
+    return any(marker in q for marker in advice_markers)
 def _top_feature_names(context: Dict[str, Any], top_n: int = 3) -> List[str]:
     features = _shortlist_top_features_from_shap(context.get("shap"), top_n=top_n)
     names = []
@@ -270,13 +286,99 @@ def _is_data_intent(intent_key: str) -> bool:
         "model_tracking",
         "training_details",
         "overfitting",
+        "underfitting",
         "full_summary",
         "lifecycle",
         "data_stats",
         "available_models",
     }
+_STRICT_HANDLER_INTENTS = {
+    "help",
+    "churn_rate",
+    "metrics",
+    "dataset_summary",
+    "missing_values",
+    "predictions_summary",
+    "high_risk",
+    "simulation",
+    "columns",
+    "explain_customer",
+    "model_info",
+    "model_tracking",
+    "training_details",
+    "full_summary",
+    "lifecycle",
+    "data_stats",
+    "available_models",
+}
+_GROUNDED_HANDLER_INTENTS = {
+    "top_drivers",
+    "recommend_actions",
+    "segment_analysis",
+    "model_explanation",
+    "overfitting",
+    "underfitting",
+}
+_PRE_LLM_STRICT_INTENTS = {
+    "help",
+    "churn_rate",
+    "metrics",
+    "dataset_summary",
+    "missing_values",
+    "predictions_summary",
+    "high_risk",
+    "simulation",
+    "columns",
+    "explain_customer",
+    "model_info",
+    "model_tracking",
+    "training_details",
+    "full_summary",
+    "lifecycle",
+    "data_stats",
+    "available_models",
+}
+_GENERAL_CHAT_MARKERS = (
+    "who are you",
+    "what are you",
+    "how are you",
+    "how intelligent are you",
+    "how smart are you",
+    "are you intelligent",
+    "are you smart",
+    "tell me about yourself",
+    "what can you answer",
+)
+def _match_intent(query: str, fuzzy_threshold: float | None = None) -> Tuple[str, float]:
+    q = _normalize(query)
+    for pattern, intent_key in _INTENTS:
+        if pattern.search(q):
+            return intent_key, 1.0
+    if fuzzy_threshold is not None:
+        intent_key, score = _fuzzy_intent_match(query)
+        if intent_key and score >= fuzzy_threshold:
+            return intent_key, score
+    return "", 0.0
+def _is_general_chat_query(query: str) -> bool:
+    q = _normalize(query)
+    return any(marker in q for marker in _GENERAL_CHAT_MARKERS)
+def _answer_from_handler(
+    intent_key: str,
+    query: str,
+    context: Dict[str, Any],
+    score: float | None = None,
+) -> str:
+    handler = _INTENT_HANDLERS.get(intent_key)
+    if not handler:
+        return ""
+    answer = handler(context or {})
+    if score is not None and score < 1.0:
+        answer += f"\n\n*(Matched as: {intent_key}, confidence: {score:.0%})*"
+    return answer
 def _needs_completeness_guard(query: str, intent_key: str = "") -> bool:
     if _is_concept_query(query):
+        return False
+    if intent_key == "full_summary" or _is_full_summary_query(query):
         return False
     if intent_key:
         return False
@@ -314,91 +416,265 @@ def _metric_summary_for_answer(context: Dict[str, Any]) -> str:
         except Exception:
             parts.append(f"{label} {val}")
     return ", ".join(parts)
-def _build_grounded_complete_answer(query: str, context: Dict[str, Any], intent_key: str = "") -> str:
+def _has_system_results(context: Dict[str, Any]) -> bool:
     context = context or {}
+    return any(
+        bool(context.get(key))
+        for key in ("eda", "metrics", "predictions", "shap", "simulate", "segment_result", "lifecycle")
+    )
+def _is_system_related_query(query: str) -> bool:
     q = _normalize(query)
-    lines: List[str] = []
+    if not q:
+        return False
+    markers = (
+        "churn", "customer", "retention", "dataset", "data", "eda", "missing",
+        "model", "metric", "accuracy", "recall", "precision", "f1", "auc",
+        "roc", "prediction", "predict", "risk", "driver", "feature", "shap",
+        "segment", "lifecycle", "simulation", "roi", "revenue", "campaign",
+        "result", "results", "outcome", "insight", "conclusion", "analysis",
+        "system", "assistant", "chatbot", "dashboard", "webapp", "app", "section", "train", "trained", "deploy",
+        "trust", "reliable", "good", "bad", "improve", "reduce", "action",
+    )
+    return any(marker in q for marker in markers)
+def _append_if(lines: List[str], value: str | None) -> None:
+    if value:
+        lines.append(value)
+def _dataset_fact(context: Dict[str, Any]) -> str:
+    eda = context.get("eda") or {}
+    if not isinstance(eda, dict) or not eda:
+        return ""
+    rows = eda.get("n_rows") or (eda.get("shape") or [None])[0]
+    cols = eda.get("n_cols") or (eda.get("shape") or [None, None])[1]
+    target = eda.get("target_column") or (context.get("metrics") or {}).get("target_col")
+    missing = eda.get("missing_total")
+    parts = []
+    if rows is not None:
+        try:
+            parts.append(f"{int(rows):,} rows")
+        except Exception:
+            parts.append(f"{rows} rows")
+    if cols is not None:
+        parts.append(f"{cols} columns")
+    if target:
+        parts.append(f"target `{target}`")
+    if missing is not None:
+        try:
+            parts.append("no missing values" if int(missing) == 0 else f"{int(missing):,} missing values")
+        except Exception:
+            parts.append(f"{missing} missing values")
+    return "Dataset: " + ", ".join(parts) + "." if parts else ""
+def _model_fact(context: Dict[str, Any]) -> str:
     model_type = _get_model_type(context)
+    metric_summary = _metric_summary_for_answer(context)
+    metrics = context.get("metrics") or {}
+    if not model_type and not metric_summary:
+        return ""
+    sentence = f"Model: {model_type or 'trained model'}"
+    if metric_summary:
+        sentence += f" with {metric_summary}"
+    fit_status = metrics.get("fit_status") if isinstance(metrics, dict) else None
+    if fit_status:
+        sentence += f"; fit status: {fit_status}"
+    return sentence + "."
+def _churn_fact(context: Dict[str, Any]) -> str:
     actual = _get_actual_churn_rate(context)
     predicted = _get_predicted_churn_rate(context)
-    metrics = context.get("metrics") or {}
-    predictions = context.get("predictions") or {}
-    features = _top_feature_names(context, top_n=3)
-    recall = metrics.get("recall") if isinstance(metrics, dict) else None
-    if intent_key == "overfitting" or "overfit" in q or "underfit" in q:
-        lines.append("Here is the grounded overfitting read from your model context.")
-    elif any(k in q for k in ("reliable", "trust", "deploy")) or (
-        "model" in q and any(k in q for k in ("good", "quality", "perform"))
-    ):
-        recall_rate = _as_rate(recall)
-        if recall_rate is None:
-            lines.append("I cannot fully judge model reliability yet because recall is not available.")
-        elif recall_rate < 0.50:
-            lines.append(f"No - this model is not reliable enough for churn decisions yet because recall is only {_fmt_pct(recall_rate)}.")
-        elif recall_rate < 0.70:
-            lines.append(f"Partly - recall is {_fmt_pct(recall_rate)}, so the model captures most churners but can still improve.")
-        else:
-            lines.append(f"Yes - recall is {_fmt_pct(recall_rate)}, so the model catches most real churners.")
-    elif intent_key in {"churn_rate", "predictions_summary", "high_risk"} or "churn" in q or "predict" in q:
-        if actual is not None and predicted is not None:
-            diff = (predicted - actual) * 100
-            direction = "underestimating" if diff < 0 else "overestimating" if diff > 0 else "matching"
-            lines.append(
-                f"Actual churn is {_fmt_pct(actual)} and predicted churn is {_fmt_pct(predicted)}. "
-                f"The model is {direction} churn by {abs(diff):.1f} percentage points."
-            )
-        elif actual is not None:
-            lines.append(f"Actual churn is {_fmt_pct(actual)}. Predicted churn is not available yet.")
-        elif predicted is not None:
-            lines.append(f"Predicted churn is {_fmt_pct(predicted)}. Actual churn is not available yet.")
-        else:
-            lines.append("Churn rate is not available yet from the current context.")
-    elif intent_key == "top_drivers" or "driver" in q or "feature" in q:
-        if features:
-            lines.append("The strongest churn drivers currently identified are " + ", ".join(features) + ".")
-        else:
-            lines.append("Top churn drivers are not available yet.")
-    else:
-        lines.append("Here is the grounded answer using the available churn context.")
-    facts: List[str] = []
-    if model_type:
-        facts.append(f"- Model: {model_type}")
-    if actual is not None:
-        facts.append(f"- Actual churn rate: {_fmt_pct(actual)}")
-    if predicted is not None:
-        facts.append(f"- Predicted churn rate: {_fmt_pct(predicted)}")
-    metric_summary = _metric_summary_for_answer(context)
-    if metric_summary:
-        facts.append(f"- Model metrics: {metric_summary}")
-    if isinstance(predictions, dict):
-        high = predictions.get("high_risk")
-        total = predictions.get("total_customers") or predictions.get("total")
-        if high is not None:
-            try:
-                high_text = f"{int(high):,}"
-                if total:
-                    high_text += f" of {int(total):,} scored customers"
-                facts.append(f"- High-risk customers: {high_text}")
-            except Exception:
-                facts.append(f"- High-risk customers: {high}")
-    if features:
-        facts.append(f"- Top churn drivers: {', '.join(features)}")
-    if facts:
-        lines.append("\nKey context:")
-        lines.extend(facts)
-    if recall is not None:
-        lines.append(f"\nBusiness verdict: {_recall_verdict(recall)}")
-    elif isinstance(metrics, dict) and metrics:
-        lines.append("\nBusiness verdict: Recall is not available, so model usefulness for catching churners cannot be fully judged yet.")
-    if features:
-        lines.append(
-            "This means retention decisions should focus on the customers affected by those drivers, "
-            "while using recall to judge whether the model is catching enough real churners."
+    if actual is None and predicted is None:
+        return ""
+    if actual is not None and predicted is not None:
+        diff = (predicted - actual) * 100
+        direction = "underestimates" if diff < 0 else "overestimates" if diff > 0 else "matches"
+        return (
+            f"Churn: actual churn is {_fmt_pct(actual)} and predicted churn is {_fmt_pct(predicted)}, "
+            f"so the model {direction} churn by {abs(diff):.1f} percentage points."
         )
+    if actual is not None:
+        return f"Churn: actual churn is {_fmt_pct(actual)}; predicted churn is not available yet."
+    return f"Churn: predicted churn is {_fmt_pct(predicted)}; actual churn is not available yet."
+def _prediction_fact(context: Dict[str, Any]) -> str:
+    predictions = context.get("predictions") or {}
+    if not isinstance(predictions, dict) or not predictions:
+        return ""
+    parts = []
+    total = predictions.get("total_customers") or predictions.get("total")
+    churn_count = predictions.get("churn_count") or predictions.get("predicted_churn")
+    high = predictions.get("high_risk")
+    revenue = predictions.get("revenue_at_risk")
+    if total is not None:
+        try:
+            parts.append(f"{int(total):,} customers scored")
+        except Exception:
+            parts.append(f"{total} customers scored")
+    if churn_count is not None:
+        try:
+            parts.append(f"{int(churn_count):,} predicted churners")
+        except Exception:
+            parts.append(f"{churn_count} predicted churners")
+    if high is not None:
+        try:
+            parts.append(f"{int(high):,} high-risk customers")
+        except Exception:
+            parts.append(f"{high} high-risk customers")
+    if revenue is not None:
+        try:
+            parts.append(f"${float(revenue):,.2f} revenue at risk")
+        except Exception:
+            parts.append(f"{revenue} revenue at risk")
+    return "Predictions: " + ", ".join(parts) + "." if parts else ""
+def _drivers_fact(context: Dict[str, Any]) -> str:
+    features = _top_feature_names(context, top_n=3)
+    if not features:
+        return ""
+    return "Drivers: the strongest available churn drivers are " + ", ".join(features) + "."
+def _section_fact(context: Dict[str, Any], section: str) -> str:
+    if section == "dataset":
+        return _dataset_fact(context)
+    if section == "model":
+        return _model_fact(context)
+    if section == "churn":
+        return _churn_fact(context)
+    if section == "predictions":
+        return _prediction_fact(context)
+    if section == "drivers":
+        return _drivers_fact(context)
+    if section == "simulation":
+        sim = context.get("simulate") or {}
+        if not isinstance(sim, dict) or not sim:
+            return ""
+        pieces = []
+        if sim.get("roi") is not None:
+            pieces.append(f"ROI {sim.get('roi')}")
+        if sim.get("revenue_saved") is not None:
+            pieces.append(f"revenue saved {sim.get('revenue_saved')}")
+        if sim.get("retained_customers") is not None:
+            pieces.append(f"retained customers {sim.get('retained_customers')}")
+        return "Simulation: " + ", ".join(pieces) + "." if pieces else ""
+    if section == "segments":
+        segment = context.get("segment_result") or context.get("segment") or {}
+        lifecycle = context.get("lifecycle") or {}
+        pieces = []
+        if isinstance(segment, dict) and segment:
+            col = segment.get("column") or segment.get("result", {}).get("column")
+            if col:
+                pieces.append(f"segment analysis is available for {col}")
+        if isinstance(lifecycle, dict) and lifecycle:
+            high = lifecycle.get("highest_risk_segment")
+            col = lifecycle.get("column_used")
+            if high:
+                pieces.append(f"highest lifecycle risk segment is {high}" + (f" using {col}" if col else ""))
+        return "Segments: " + "; ".join(pieces) + "." if pieces else ""
+    return ""
+def _relevant_sections(query: str) -> List[str]:
+    q = _normalize(query)
+    if any(k in q for k in ("all result", "everything", "overview", "summary", "section", "outcome", "conclusion", "insight", "dashboard", "webapp", "app")):
+        return ["dataset", "model", "churn", "predictions", "drivers", "segments", "simulation"]
+    sections: List[str] = []
+    if any(k in q for k in ("dataset", "data", "eda", "row", "column", "missing", "quality")):
+        sections.append("dataset")
+    if any(k in q for k in ("model", "metric", "accuracy", "recall", "precision", "f1", "auc", "roc", "overfit", "underfit", "train", "trust", "reliable", "deploy", "good", "bad")):
+        sections.extend(["model", "churn"])
+    if any(k in q for k in ("churn", "rate", "actual", "predicted")):
+        sections.append("churn")
+    if any(k in q for k in ("predict", "prediction", "risk", "customer", "score")):
+        sections.append("predictions")
+    if any(k in q for k in ("why", "driver", "factor", "cause", "feature", "shap", "reduce", "retention", "action", "improve")):
+        sections.append("drivers")
+    if any(k in q for k in ("segment", "group", "lifecycle", "stage", "tenure")):
+        sections.append("segments")
+    if any(k in q for k in ("simulation", "roi", "campaign", "revenue", "cost", "save")):
+        sections.append("simulation")
+    if not sections:
+        sections = ["churn", "model", "drivers", "predictions"]
+    unique: List[str] = []
+    for section in sections:
+        if section not in unique:
+            unique.append(section)
+    return unique
+def _build_system_aware_answer(query: str, context: Dict[str, Any]) -> str:
+    context = context or {}
+    q = _normalize(query)
+    if _is_concept_query(query):
+        return _handle_concept_question(query, context)
+    if _is_full_summary_query(query):
+        return _handle_full_summary(context)
+    if _is_model_advice_query(query):
+        return _handle_model_advice_question(context)
+    if not _has_system_results(context):
+        return _general_missing_system_answer(query, context)
+    facts = [
+        fact for fact in (_section_fact(context, section) for section in _relevant_sections(query))
+        if fact
+    ]
+    if not facts:
+        facts = [
+            fact for fact in (
+                _churn_fact(context),
+                _model_fact(context),
+                _drivers_fact(context),
+                _prediction_fact(context),
+            )
+            if fact
+        ]
+    if any(k in q for k in ("reduce", "improve", "retain", "retention", "action", "what should")):
+        lead = "To reduce churn, start with the customers the model marks as risky and target the drivers behind that risk."
+        close = "Next step: use the high-risk list for targeting, then design retention actions around the strongest drivers instead of treating all customers the same."
+    elif "predict" in q and any(k in q for k in ("actual", "lower", "higher", "underestimate", "overestimate", "different")):
+        lead = "The prediction result is different from actual churn because the model is estimating churn from learned patterns, not copying the historical label distribution."
+        close = "Next step: check recall, calibration, and the prediction threshold before using the gap as a business forecast."
+    elif any(k in q for k in ("dashboard", "webapp", "app", "system", "assistant", "chatbot")) and not any(k in q for k in ("trust", "reliable", "deploy", "good", "bad")):
+        lead = "Here's what your current results show: the app is turning your dataset into churn risk, model quality, drivers, and action guidance."
+        close = "Next step: read the results in this order: dataset quality, model quality, churn gap, high-risk customers, drivers, then retention action."
+    elif any(k in q for k in ("trust", "reliable", "deploy", "good", "bad")):
+        recall = _get_metric(context, "recall")
+        lead = _recall_verdict(recall) if recall is not None else "I would not judge deployment readiness yet because recall is not available."
+        close = "Next step: validate recall, train-test gap, and the high-risk list before using the model for business decisions."
+    elif any(k in q for k in ("conclusion", "insight", "outcome", "think", "takeaway")):
+        lead = "The main takeaway is that your webapp has enough churn outputs to support decisions, but the quality of the decision depends on model recall and the available churn drivers."
+        close = "Next step: turn the top drivers into retention actions and keep recall as the main quality gate."
+    elif any(k in q for k in ("why", "reason", "cause")):
+        lead = "The best explanation should come from the model drivers, not from guessing."
+        close = "Next step: focus analysis on the top drivers and validate them with segment or lifecycle views if available."
     else:
-        lines.append("Next step: generate feature importance so the numbers can be connected to specific churn causes.")
-    return "\n".join(lines)
-def _enforce_answer_completeness(answer: str, query: str, context: Dict[str, Any], intent_key: str = "") -> str:
+        lead = "Based on your current model results:"
+        close = "Next step: use the relevant app section to generate any missing result before making a business decision."
+    if facts:
+        return lead + "\n\n" + "\n".join(f"- {fact}" for fact in facts[:5]) + "\n\n" + close
+    return lead + "\n\nThe specific result needed for this question is not available yet.\n\n" + close
+def _build_grounded_complete_answer(
+    query: str,
+    context: Dict[str, Any],
+    intent_key: str = "",
+    use_llm: bool = False,
+    original_answer: str = "",
+) -> str:
+    if use_llm:
+        return original_answer
+    context = context or {}
+    if _is_concept_query(query):
+        return _handle_concept_question(query, context)
+    if intent_key == "full_summary" or _is_full_summary_query(query):
+        return _handle_full_summary(context)
+    q = _normalize(query)
+    if intent_key == "underfitting" or "underfit" in q:
+        return _handle_underfitting(context)
+    if intent_key == "overfitting" or "overfit" in q:
+        return _handle_overfitting(context)
+    if not _is_system_related_query(query):
+        return _fallback_for_open_question(query, context)
+    return _build_system_aware_answer(query, context)
+def _enforce_answer_completeness(
+    answer: str,
+    query: str,
+    context: Dict[str, Any],
+    intent_key: str = "",
+    use_llm: bool = False,
+) -> str:
+    if use_llm:
+        return answer
+    if _is_concept_query(query):
+        return answer
+    if intent_key == "full_summary" or _is_full_summary_query(query):
+        return answer
     if not answer or not _needs_completeness_guard(query, intent_key):
         return answer
     context = context or {}
@@ -447,10 +723,18 @@ def _enforce_answer_completeness(answer: str, query: str, context: Dict[str, Any
         additions.append(f"- Top churn drivers: {', '.join(features)}")
     if not additions:
         return answer
-    return _build_grounded_complete_answer(query, context, intent_key)
+    return _build_grounded_complete_answer(
+        query,
+        context,
+        intent_key,
+        use_llm=use_llm,
+        original_answer=answer,
+    )
 def _handle_concept_question(query: str, context: Dict[str, Any]) -> str:
     q = _normalize(query)
-    metrics = context.get("metrics") or {}
+    # Pure concept routes intentionally do not read session state. Mixed or
+    # session-specific questions are handled by deterministic system routes.
+    metrics: Dict[str, Any] = {}
     if "recall" in q:
         lines = [
             "Recall is the percentage of actual positive cases that the model correctly identifies.",
@@ -539,19 +823,13 @@ def _handle_concept_question(query: str, context: Dict[str, Any]) -> str:
             "",
             "In this system, churn is the outcome the model tries to predict so the business can intervene earlier.",
         ]
-        actual = _get_actual_churn_rate(context)
-        if actual is not None:
-            lines.append(f"\nIn your dataset, actual churn is {_fmt_pct(actual)}.")
         return "\n".join(lines)
     if "model" in q:
-        model_type = _get_model_type(context)
         lines = [
             "A machine learning model is a trained pattern-recognition system that learns from historical data and makes predictions on new records.",
             "",
             "Here, the model learns customer patterns linked to churn and outputs churn risk.",
         ]
-        if model_type:
-            lines.append(f"\nYour current model is {model_type}.")
         return "\n".join(lines)
     return "This is a general ML concept question. Ask about a specific term like recall, churn, overfitting, precision, or ROC-AUC and I will explain it in churn context."
 # -------------------------
@@ -569,78 +847,41 @@ def redact_text(text: str) -> str:
     for p in PII_PATTERNS:
         out = p.sub("[REDACTED]", out)
     return out
+def _sanitize_context_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(k): _sanitize_context_value(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_context_value(v) for v in value]
+    if isinstance(value, tuple):
+        return [_sanitize_context_value(v) for v in value]
+    if isinstance(value, str):
+        return redact_text(value)
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    return redact_text(str(value))
 def redact_context(context: Dict[str, Any]) -> Dict[str, Any]:
-    """Return a small redacted summary for sending to an external LLM."""
-    safe = {}
+    """Return redacted system context for the LLM without dropping useful app results."""
     if not context:
-        return safe
-    eda = context.get("eda")
-    if eda and isinstance(eda, dict):
-        safe_eda = {}
-        if "shape" in eda:
-            safe_eda["shape"] = eda.get("shape")
-        if "n_rows" in eda:
-            safe_eda["n_rows"] = eda.get("n_rows")
-        if "n_cols" in eda:
-            safe_eda["n_cols"] = eda.get("n_cols")
-        cols = eda.get("columns")
-        if cols:
-            names = []
-            if isinstance(cols, list):
-                for c in cols:
-                    if isinstance(c, dict) and "name" in c:
-                        names.append(str(c["name"]))
-                    elif isinstance(c, str):
-                        names.append(c)
-            safe_eda["columns"] = names[:200]
-        if "missing_total" in eda:
-            safe_eda["missing_total"] = eda.get("missing_total")
-        if "target_column" in eda:
-            safe_eda["target_column"] = eda.get("target_column")
-        if "churn_rate" in eda:
-            safe_eda["churn_rate"] = eda.get("churn_rate")
-        safe["eda"] = safe_eda
-    metrics = context.get("metrics")
-    if metrics and isinstance(metrics, dict):
-        safe_metrics = {}
-        for k, v in metrics.items():
-            if isinstance(v, (int, float)):
-                safe_metrics[k] = float(v)
-            elif isinstance(v, str) and len(v) < 200:
-                safe_metrics[k] = redact_text(v)
-        safe["metrics"] = safe_metrics
-    shap = context.get("shap")
-    if shap and isinstance(shap, dict):
-        top = shap.get("top_features") or shap.get("features") or []
-        safe_top = []
-        for f in top[:50]:
-            if isinstance(f, dict):
-                name = str(f.get("name", ""))
-                mean_abs = f.get("mean_abs_shap")
-                try:
-                    safe_top.append({"name": name, "mean_abs_shap": float(mean_abs) if mean_abs is not None else None})
-                except Exception:
-                    safe_top.append({"name": name, "mean_abs_shap": None})
-            else:
-                safe_top.append({"name": str(f)})
-        safe["shap"] = {"top_features": safe_top}
-    sim = context.get("simulate")
-    if sim and isinstance(sim, dict):
-        safe_sim = {}
-        for k in ("before_churn_rate", "after_churn_rate", "retained_customers", "revenue_saved", "action_cost", "roi"):
-            if k in sim and isinstance(sim[k], (int, float)):
-                safe_sim[k] = float(sim[k])
-        safe["simulate"] = safe_sim
-    # Include current_model explicitly
-    current_model = context.get("current_model") or (metrics and metrics.get("model_type")) or ""
-    if current_model:
-        safe["current_model"] = str(current_model)
-    # Include available_models (what the system supports, not what has been trained)
-    available = context.get("available_models")
-    if available and isinstance(available, list):
-        safe["available_models"] = [str(m) for m in available]
-    else:
-        # Hard-coded fallback so the LLM always knows supported algorithms
+        return {}
+    safe: Dict[str, Any] = {}
+    for key in (
+        "eda",
+        "metrics",
+        "predictions",
+        "shap",
+        "simulate",
+        "segment",
+        "segment_result",
+        "lifecycle",
+        "model_history",
+        "available_models",
+        "current_model",
+    ):
+        if key in context and context.get(key) is not None:
+            safe[key] = _sanitize_context_value(context.get(key))
+    if "segment" not in safe and "segment_result" in safe:
+        safe["segment"] = safe["segment_result"]
+    if "available_models" not in safe:
         safe["available_models"] = [
             "Logistic Regression",
             "Random Forest",
@@ -651,94 +892,6 @@ def redact_context(context: Dict[str, Any]) -> Dict[str, Any]:
             "Naive Bayes",
             "CatBoost",
         ]
-    # Include model history summary
-    history = context.get("model_history")
-    if history and isinstance(history, list):
-        safe_history = []
-        for h in history[-5:]:
-            if isinstance(h, dict):
-                entry = {
-                    "model_type": h.get("model_type") or h.get("model", ""),
-                    "suspicious": bool(h.get("suspicious")),
-                }
-                m2 = h.get("metrics") or h
-                if isinstance(m2, dict):
-                    entry["metrics"] = {
-                        k: float(v) for k, v in m2.items()
-                        if isinstance(v, (int, float))
-                    }
-                safe_history.append(entry)
-        safe["model_history"] = safe_history
-    # Include predictions summary
-    predictions = context.get("predictions")
-    if predictions and isinstance(predictions, dict):
-        safe_pred = {}
-        for k in ("total_customers", "total", "high_risk", "medium_risk", "low_risk",
-                  "predicted_churn_rate", "predicted_churn", "revenue_at_risk",
-                  "churn_count", "churn_rate"):
-            if k in predictions:
-                try:
-                    safe_pred[k] = float(predictions[k])
-                except Exception:
-                    pass
-        # Also include probability_summary if present
-        prob_summary = predictions.get("probability_summary")
-        if isinstance(prob_summary, dict):
-            safe_pred["probability_summary"] = {
-                k: float(v) for k, v in prob_summary.items()
-                if isinstance(v, (int, float))
-            }
-        safe["predictions"] = safe_pred
-    # Include lifecycle summary
-    lifecycle = context.get("lifecycle")
-    if lifecycle and isinstance(lifecycle, dict):
-        safe["lifecycle"] = {
-            "column_used": lifecycle.get("column_used", ""),
-            "highest_risk_segment": lifecycle.get("highest_risk_segment", ""),
-        }
-        # Also include per-stage stats if available (no raw data, just aggregated rates)
-        raw_segments = lifecycle.get("segments")
-        if isinstance(raw_segments, dict):
-            safe_stages = {}
-            for stage, stats in raw_segments.items():
-                if isinstance(stats, dict):
-                    safe_stages[stage] = {
-                        k: float(v) for k, v in stats.items()
-                        if isinstance(v, (int, float)) and k in ("customers", "churned", "not_churned", "churn_rate")
-                    }
-            if safe_stages:
-                safe["lifecycle"]["segments"] = safe_stages
-    # Include segment analysis result
-    segment_result = (
-        context.get("segment_result")
-        or context.get("segment")
-        or context.get("time_churn")
-    )
-    if segment_result and isinstance(segment_result, dict):
-        safe_seg: Dict[str, Any] = {}
-        safe_seg["column"] = str(segment_result.get("column") or
-                                  segment_result.get("result", {}).get("column") or "")
-        safe_seg["mode"] = str(segment_result.get("mode") or "")
-        raw_segs = (
-            segment_result.get("segments")
-            or segment_result.get("result", {}).get("segments")
-            or []
-        )
-        safe_segs = []
-        if isinstance(raw_segs, list):
-            for s in raw_segs[:20]:
-                if isinstance(s, dict):
-                    entry: Dict[str, Any] = {"value": str(s.get("value", ""))}
-                    for fld in ("customers", "churned", "not_churned", "churn_rate"):
-                        if fld in s:
-                            try:
-                                entry[fld] = float(s[fld])
-                            except Exception:
-                                pass
-                    safe_segs.append(entry)
-        safe_seg["segments"] = safe_segs
-        if safe_seg["column"] or safe_segs:
-            safe["segment"] = safe_seg
     return safe
 # -------------------------
 # Model explanation dictionary
@@ -781,6 +934,136 @@ MODEL_EXPLANATIONS = {
         "suggesting possible data leakage or trivially separable class boundaries."
     ),
 }
+def _handle_model_advice_question(context: Dict[str, Any]) -> str:
+    context = context or {}
+    metrics = context.get("metrics") or {}
+    history = context.get("model_history") or []
+    current_model = _get_model_type(context)
+    lines = [
+        "For churn prediction, tree-based models like CatBoost, XGBoost, Random Forest, and Gradient Boosting are usually strong candidates.",
+        "",
+        "They work well because churn is often driven by non-linear interactions between tenure, contract type, usage, billing, and support behavior.",
+    ]
+    if current_model or metrics:
+        lines.append("\nIn your system:")
+        if current_model:
+            lines.append(f"- Current model: {current_model}")
+        metric_summary = _metric_summary_for_answer(context)
+        if metric_summary:
+            lines.append(f"- Current metrics: {metric_summary}")
+        fit_status = metrics.get("fit_status") if isinstance(metrics, dict) else None
+        if fit_status:
+            lines.append(f"- Fit status: {fit_status}")
+        recall = metrics.get("recall") if isinstance(metrics, dict) else None
+        if recall is not None:
+            lines.append(f"- Recall read: {_recall_verdict(recall)}")
+    best_name = ""
+    best_score = None
+    if isinstance(history, list):
+        for item in history:
+            if not isinstance(item, dict) or item.get("suspicious"):
+                continue
+            m2 = item.get("metrics") or item
+            score = _as_float(m2.get("roc_auc"))
+            if score is None:
+                score = _as_float(m2.get("f1"))
+            if score is None:
+                score = _as_float(m2.get("recall"))
+            if score is None:
+                continue
+            if best_score is None or score > best_score:
+                best_score = score
+                best_name = str(item.get("model_type") or item.get("model") or "").strip()
+    if best_name:
+        lines.append(f"\nAmong your trained non-suspicious models, {best_name} currently looks strongest by the available comparison score.")
+    else:
+        lines.append("\nI would not declare a single best model from theory alone. Compare models on your validation/test data, then prioritize recall if the business goal is catching churners early.")
+    lines.append("Practical next step: compare CatBoost/XGBoost/Random Forest, check train-test gap, and choose the model with the best recall-F1 balance rather than accuracy alone.")
+    return "\n".join(lines)
+def _handle_known_ml_question(query: str, context: Dict[str, Any]) -> str:
+    q = _normalize(query)
+    concept_markers = ("what is", "what does", "define", "explain", "meaning", "how does")
+    if not any(marker in q for marker in concept_markers):
+        return ""
+    for model_name, explanation in MODEL_EXPLANATIONS.items():
+        if model_name.lower() in q:
+            lines = [
+                f"{model_name} is a machine learning algorithm used for prediction tasks such as churn classification.",
+                "",
+                explanation,
+            ]
+            current_model = _get_model_type(context)
+            if current_model and current_model.lower() == model_name.lower():
+                lines.append(f"\nIn your system, {model_name} is the current trained model.")
+            return "\n".join(lines)
+    if "shap" in q or "feature importance" in q:
+        lines = [
+            "SHAP explains how much each feature contributes to a model's predictions.",
+            "",
+            "In churn prediction, SHAP helps turn model output into business drivers, such as tenure, contract type, or billing behavior.",
+        ]
+        features = _top_feature_names(context, top_n=3)
+        if features:
+            lines.append(f"\nIn your current system, the top available drivers are: {', '.join(features)}.")
+        return "\n".join(lines)
+    if "confusion matrix" in q:
+        return (
+            "A confusion matrix shows correct and incorrect predictions split into true positives, false positives, true negatives, and false negatives.\n\n"
+            "For churn, false negatives are especially important because they are real churners the model missed."
+        )
+    if "threshold" in q:
+        return (
+            "A prediction threshold is the cutoff used to turn a churn probability into a yes/no churn prediction.\n\n"
+            "Lowering the threshold usually increases recall, meaning the model catches more churners, but it can also create more false alarms."
+        )
+    return ""
+def _general_missing_system_answer(query: str, context: Dict[str, Any] | None = None) -> str:
+    q = _normalize(query)
+    if "joke" in q:
+        return "Why did the spreadsheet bring a ladder? Because it wanted to reach the next level of analysis."
+    if any(k in q for k in ("eda", "exploratory", "dataset", "data summary")):
+        return (
+            "EDA means exploratory data analysis. In this webapp, it is the section that helps you understand the dataset before modeling: rows, columns, missing values, target column, distributions, and data quality.\n\n"
+            "For your current session, I do not have a specific EDA result to quote, so I will not invent row counts or column names."
+        )
+    if "missing" in q or "null" in q:
+        return (
+            "Missing values are blank or unavailable entries in a dataset. They matter because models need a consistent input table.\n\n"
+            "In this webapp, the EDA section reports missing-value counts, and preprocessing handles missing numeric values and categories before training. I do not have a current missing-value count to quote."
+        )
+    if any(k in q for k in ("reduce", "improve", "retain", "retention", "action", "recommend")):
+        return (
+            "To reduce churn, start by identifying at-risk customers, then target the reasons behind their risk: low engagement, contract friction, pricing concerns, poor onboarding, service issues, or weak loyalty signals.\n\n"
+            "Once this webapp has model predictions and churn drivers, those actions can become much more specific."
+        )
+    if any(k in q for k in ("driver", "feature", "shap", "why", "reason", "cause")):
+        return (
+            "Churn drivers are the features that most influence churn risk. SHAP-style explanations help translate model behavior into business reasons, such as tenure, contract type, activity, geography, pricing, or usage patterns.\n\n"
+            "I do not have current top-driver results here, so the safest answer is conceptual rather than data-specific."
+        )
+    if "churn rate" in q or "churn" in q:
+        return (
+            "Churn rate is the percentage of customers who leave, cancel, or stop using the service.\n\n"
+            "For this webapp, actual churn comes from the training labels, while predicted churn comes from model predictions. I do not have both current values available here, so I will explain the concept without inventing numbers."
+        )
+    if any(k in q for k in ("metric", "accuracy", "recall", "precision", "f1", "auc", "roc")):
+        return (
+            "Model metrics explain how well the churn model performs. Accuracy measures overall correctness, recall measures how many real churners are caught, precision measures how clean the risk list is, F1 balances precision and recall, and ROC-AUC measures ranking quality.\n\n"
+            "For churn decisions, recall is usually the most important metric because missed churners are missed retention opportunities."
+        )
+    if any(k in q for k in ("predict", "prediction", "risk", "high risk")):
+        return (
+            "Predictions are the model's estimate of which customers are likely to churn. In this webapp, prediction results can include predicted churn rate, predicted churn count, risk tiers, high-risk customers, and revenue at risk.\n\n"
+            "I do not have a current prediction result to quote, so I will not make up customer counts."
+        )
+    if any(k in q for k in ("model", "algorithm", "train", "training")):
+        return (
+            "For churn prediction, models like Logistic Regression, Random Forest, XGBoost, Gradient Boosting, and CatBoost are common choices. The best one depends on validation performance, recall, F1, ROC-AUC, and whether it generalizes well.\n\n"
+            "I do not have current trained-model results to compare, so I can explain the options generally but will not claim which model won in your session."
+        )
+    return (
+        "I can answer generally. If the question needs a specific number from this churn webapp, that result is not available in the current context, so I will not invent it."
+    )
 def _handle_help(_context: Dict[str, Any]) -> str:
     return (
         "Here's what I can help you with:\n\n"
@@ -803,11 +1086,7 @@ def _handle_churn_rate(context: Dict[str, Any]) -> str:
     recall = _get_metric(context, "recall")
     features = _top_feature_names(context, top_n=3)
     if actual_rate is None and predicted_rate is None:
-        return (
-            "Churn rate is not available yet.\n\n"
-            "Actual churn rate becomes available after training because it comes from the target labels. "
-            "Predicted churn rate becomes available after running predictions."
-        )
+        return _general_missing_system_answer("churn rate", context)
     lines: List[str] = []
     if actual_rate is not None:
         level = "high" if actual_rate > 0.4 else "moderate" if actual_rate > 0.2 else "relatively low"
@@ -815,12 +1094,12 @@ def _handle_churn_rate(context: Dict[str, Any]) -> str:
         lines.append(f"This is the ground-truth churn rate from your training labels, and it is {level}.")
     else:
         lines.append("**Actual churn rate: not available yet**")
-        lines.append("Train a model first; the actual churn rate comes from the selected target column.")
+        lines.append("This specific value comes from the selected churn label in training results.")
     if predicted_rate is not None:
         lines.append(f"**Predicted churn rate: {_fmt_pct(predicted_rate, 2)}**")
     else:
         lines.append("**Predicted churn rate: not available yet**")
-        lines.append("Run predictions after training to compare model output against actual churn.")
+        lines.append("This specific value comes from the prediction results section.")
     if actual_rate is not None and predicted_rate is not None:
         diff = (predicted_rate - actual_rate) * 100
         direction = "underestimating" if diff < 0 else "overestimating" if diff > 0 else "matching"
@@ -841,10 +1120,7 @@ def _handle_churn_rate(context: Dict[str, Any]) -> str:
 def _handle_top_drivers(context: Dict[str, Any]) -> str:
     features = _shortlist_top_features_from_shap(context.get("shap"), top_n=5)
     if not features:
-        return (
-            "Top churn drivers are not available yet.\n\n"
-            "Train a model first so the system can compute feature importance and explain why customers are likely to churn."
-        )
+        return _general_missing_system_answer("churn drivers", context)
     lines = ["Here is what is driving churn in your current model:\n"]
     for i, f in enumerate(features):
         name = f.get("name", "<unknown>") if isinstance(f, dict) else str(f)
@@ -864,10 +1140,7 @@ def _handle_top_drivers(context: Dict[str, Any]) -> str:
 def _handle_metrics(context: Dict[str, Any]) -> str:
     m = context.get("metrics") or {}
     if not m:
-        return (
-            "Model metrics are not available yet because no model has been trained in this session.\n\n"
-            "Train a model first. After training, I can explain accuracy, recall, precision, F1, ROC-AUC, actual churn rate, and how the result connects to your churn risk."
-        )
+        return _general_missing_system_answer("model metrics", context)
     lines = ["Here is what the current model performance means:\n"]
     model_type = _get_model_type(context)
     if model_type:
@@ -911,26 +1184,22 @@ def _handle_metrics(context: Dict[str, Any]) -> str:
             + ", so performance should be interpreted around whether the model is catching customers affected by those factors."
         )
     else:
-        lines.append("Top churn drivers are not available yet; train/refresh model explanation to connect metrics to causes.")
+        lines.append("Top churn drivers are not available in the current results, so I can explain the metrics but not the specific causes behind them.")
     lines.append("Next step: optimize for recall if the business goal is to catch more at-risk customers before they leave.")
     return "\n".join(lines)
 def _handle_simulation(context: Dict[str, Any]) -> str:
     sim = context.get("simulate")
     if not sim:
         return (
-            "No retention simulation has been run yet.\n\n"
-            "Go to the **Simulate** tab and enter a discount percentage, contract extension length, "
-            "and cost per customer. I'll summarize the projected impact once it's done."
+            "A retention simulation estimates whether an intervention is worth the cost. It usually compares expected churn before and after an action, retained customers, revenue saved, campaign cost, and ROI.\n\n"
+            "I do not have a current simulation result to quote, so I can explain the idea but will not invent ROI or revenue saved."
         )
     return "Here's a summary of the last retention simulation:\n\n" + _format_simulation(sim)
 def _handle_columns(context: Dict[str, Any]) -> str:
     eda = context.get("eda") or {}
     cols = eda.get("columns")
     if not cols:
-        return (
-            "No dataset has been uploaded yet.\n\n"
-            "Upload a CSV or Excel file in the **Upload** tab — I'll summarize the columns and data structure right away."
-        )
+        return _general_missing_system_answer("dataset columns", context)
     if isinstance(cols, list):
         names = [c["name"] if isinstance(c, dict) and "name" in c else str(c) for c in cols]
         col_list = ", ".join(names[:50]) + ("..." if len(names) > 50 else "")
@@ -965,9 +1234,8 @@ def _handle_recommend_actions(context: Dict[str, Any]) -> str:
             lines.append(f"- **{name}**: {action}")
     else:
         lines.append(
-            "To get specific, data-driven recommendations, train a model first.\n\n"
-            "Once training is complete, the system will identify which factors most influence churn in your dataset "
-            "and I'll turn those into clear actions for your team."
+            "To reduce churn generally, focus on at-risk customers, improve onboarding, address pricing or contract friction, increase engagement, and personalize retention offers.\n\n"
+            "When model drivers are available, I can turn those general actions into dataset-specific recommendations."
         )
     if sim:
         lines.append("\n**Last simulation results:**")
@@ -991,10 +1259,7 @@ def _handle_dataset_summary(context: Dict[str, Any]) -> str:
     """Answer questions about the uploaded dataset — rows, columns, types, target."""
     eda = context.get("eda") or {}
     if not eda:
-        return (
-            "No dataset has been loaded yet.\n\n"
-            "Please upload a CSV or Excel file in the **Upload** tab to get started."
-        )
+        return _general_missing_system_answer("eda dataset", context)
     n_rows = eda.get("n_rows") or (eda.get("shape") or [None])[0]
     n_cols = eda.get("n_cols") or (eda.get("shape") or [None, None])[1]
     cols = eda.get("columns") or []
@@ -1050,10 +1315,7 @@ def _handle_missing_values(context: Dict[str, Any]) -> str:
     """Answer questions about missing values in the dataset."""
     eda = context.get("eda") or {}
     if not eda:
-        return (
-            "No dataset has been uploaded yet.\n\n"
-            "Upload a file in the **Upload** tab and the system will automatically detect missing values."
-        )
+        return _general_missing_system_answer("missing values", context)
     missing_total = eda.get("missing_total")
     cols = eda.get("columns") or []
     missing_cols = []
@@ -1099,11 +1361,7 @@ def _handle_model_info(context: Dict[str, Any]) -> str:
     metrics = context.get("metrics") or {}
     model_type = metrics.get("model_type") or context.get("model_type") or ""
     if not history and not model_type:
-        return (
-            "No model has been trained yet in this session.\n\n"
-            "Go to the **Train** tab, select a target column and an algorithm, then click Train. "
-            "You can train multiple models and compare them automatically."
-        )
+        return _general_missing_system_answer("model training", context)
     lines = []
     if history and isinstance(history, list):
         total = len(history)
@@ -1154,17 +1412,13 @@ def _handle_model_info(context: Dict[str, Any]) -> str:
 def _handle_segment_analysis(_context: Dict[str, Any]) -> str:
     """Segment analysis is available in LLM mode only."""
     return (
-        "Segment analysis insights are available in **AI assistant mode** only.\n\n"
-        "Enable the AI assistant toggle (🤖) at the top of the chat panel, then ask again — "
-        "the AI will explain churn breakdowns by any column in your dataset with full context."
+        "Segment analysis compares churn across groups, such as geography, contract type, lifecycle stage, tenure band, or activity level.\n\n"
+        "It is useful because churn is rarely uniform: one segment may need onboarding help while another needs pricing or loyalty action. I do not have a current segment breakdown to quote here."
     )
 def _handle_predictions_summary(context: Dict[str, Any]) -> str:
     predictions = context.get("predictions") or {}
     if not predictions:
-        return (
-            "Predictions are not available yet.\n\n"
-            "Train a model, then run predictions. After that I can report predicted churn rate, churn count, risk tiers, and how those outputs compare with actual churn."
-        )
+        return _general_missing_system_answer("predictions", context)
     lines = ["Here are the prediction results for your dataset:\n"]
     total = predictions.get("total_customers") or predictions.get("total")
     churn_count = predictions.get("churn_count")
@@ -1286,9 +1540,8 @@ def _handle_high_risk(context: Dict[str, Any]) -> str:
     predictions = context.get("predictions") or {}
     if not predictions:
         return (
-            "No predictions have been run yet.\n\n"
-            "Train a model and run predictions — the system will classify every customer as "
-            "High Risk (≥70% churn probability), Medium Risk, or Low Risk."
+            "High-risk customers are the customers whose predicted churn probability crosses the risk threshold, often used as the first retention target list.\n\n"
+            "I do not have a current high-risk customer count to quote, so I can explain the idea but will not invent a number."
         )
     high = predictions.get("high_risk")
     total = predictions.get("total_customers") or predictions.get("total")
@@ -1385,11 +1638,7 @@ def _handle_data_stats(context: Dict[str, Any]) -> str:
     """Answer questions about numeric statistics and distributions in the dataset."""
     eda = context.get("eda") or {}
     if not eda:
-        return (
-            "No dataset statistics are available yet.\n\n"
-            "Upload a dataset and click **Run Full EDA** to generate numeric summaries, "
-            "correlations, and category distributions."
-        )
+        return _general_missing_system_answer("dataset statistics", context)
     numeric_summary = eda.get("numeric_summary") or {}
     top_categories = eda.get("top_categories") or {}
     correlation = eda.get("correlation") or {}
@@ -1447,13 +1696,8 @@ def _handle_training_details(context: Dict[str, Any]) -> str:
     history = context.get("model_history") or []
     if not metrics and not history:
         return (
-            "No training has been done yet.\n\n"
-            "Go to the **Train** tab:\n"
-            "1. Select the **target column** (the churn label)\n"
-            "2. Choose a **model** (Logistic Regression, Random Forest, XGBoost, etc.)\n"
-            "3. Pick **Fast** or **Full** training mode\n"
-            "4. Click **Train**\n\n"
-            "The system supports 8 algorithms and automatically detects overfitting."
+            "Model training is the step where the webapp learns patterns that separate churners from non-churners.\n\n"
+            "In this system, training usually means choosing a churn target column, selecting an algorithm such as Logistic Regression, Random Forest, XGBoost, or CatBoost, then evaluating metrics like recall, F1, ROC-AUC, and fit status. I do not have current training results to quote."
         )
     lines = ["**Training Details:**\n"]
     model_type = metrics.get("model_type") or context.get("model_type") or ""
@@ -1489,8 +1733,8 @@ def _handle_training_details(context: Dict[str, Any]) -> str:
 def _handle_full_summary(context: Dict[str, Any]) -> str:
     if not context:
         return (
-            "No session results are available yet.\n\n"
-            "Upload a dataset, run EDA, train a model, and run predictions to generate a complete churn summary."
+            "A full churn summary normally combines dataset quality, model metrics, actual vs predicted churn, prediction risk tiers, top churn drivers, and retention recommendations.\n\n"
+            "I do not have current section results to quote, so I can describe the summary structure but will not invent values."
         )
     eda = context.get("eda") or {}
     metrics = context.get("metrics") or {}
@@ -1589,7 +1833,7 @@ def _handle_full_summary(context: Dict[str, Any]) -> str:
             else:
                 lines.append(f"{i}. {name}")
     else:
-        lines.append("- Top churn drivers are not available yet")
+        lines.append("- Top churn drivers are not available in the current results")
     lines.append("\n**Verdict**")
     recall = metrics.get("recall") if isinstance(metrics, dict) else None
     if recall is not None:
@@ -1609,9 +1853,8 @@ def _handle_model_tracking(context: Dict[str, Any]) -> str:
     history = context.get("model_history") or []
     if not current_model and not history:
         return (
-            "No model has been trained yet in this session.\n\n"
-            "Go to the **Train** tab, select a target column and an algorithm, then click Train. "
-            "You can train multiple models and the system will compare them automatically."
+            "Model tracking compares trained algorithms so you can choose the model that best balances recall, precision, F1, ROC-AUC, and generalization.\n\n"
+            "I do not have current model-history results to quote, so I can explain how comparison works but will not name a winning model."
         )
     lines = []
     if current_model:
@@ -1667,9 +1910,8 @@ def _handle_model_explanation(context: Dict[str, Any]) -> str:
     current_model = context.get("current_model") or (context.get("metrics") or {}).get("model_type") or ""
     if not current_model:
         return (
-            "No model has been trained yet.\n\n"
-            "Train a model in the **Train** tab and then ask again — "
-            "I'll explain why that algorithm suits churn prediction for your dataset."
+            "Different churn models have different strengths. Logistic Regression is interpretable, Random Forest handles non-linear patterns, XGBoost and CatBoost are strong for tabular churn data, and Naive Bayes is fast and simple.\n\n"
+            "I do not have a current trained model to explain, so I can compare the algorithms generally but will not claim which one your session used."
         )
     explanation = MODEL_EXPLANATIONS.get(current_model)
     if not explanation:
@@ -1697,9 +1939,8 @@ def _handle_overfitting(context: Dict[str, Any]) -> str:
     metrics = context.get("metrics") or {}
     if not metrics:
         return (
-            "Overfitting cannot be checked yet because no model metrics are available.\n\n"
-            "Overfitting means a model learns the training data too closely and performs worse on new data. "
-            "Train a model in split mode so the system can compare train vs test performance."
+            "Overfitting means a model learns the training data too closely and performs worse on new data.\n\n"
+            "To confirm it for this webapp, I would need train/test metrics or fit status. Those values are not available in the current context, so I can explain the concept but will not diagnose your model."
         )
     fit_status = metrics.get("fit_status") or metrics.get("fit") or ""
     train_score = _as_float(metrics.get("train_score") or metrics.get("train_f1"))
@@ -1733,6 +1974,44 @@ def _handle_overfitting(context: Dict[str, Any]) -> str:
     if recall is not None:
         lines.append(f"Recall is {_fmt_pct(_as_rate(recall))}. {_recall_verdict(recall)}")
     lines.append("\nNext step: if overfitting is present, try a simpler model, stronger regularization, or more conservative tree settings; if recall is below your business target, tune for recall before deployment.")
+    return "\n".join(lines)
+def _handle_underfitting(context: Dict[str, Any]) -> str:
+    metrics = context.get("metrics") or {}
+    if not metrics:
+        return (
+            "Underfitting cannot be checked yet because no model metrics are available.\n\n"
+            "Underfitting means the model is too simple and fails to learn real patterns. "
+            "It usually performs poorly on both training data and new data."
+        )
+    fit_status = metrics.get("fit_status") or metrics.get("fit") or ""
+    train_score = _as_float(metrics.get("train_score") or metrics.get("train_f1"))
+    test_score = _as_float(metrics.get("test_score") or metrics.get("f1"))
+    lines = [
+        "Underfitting means the model is too simple and fails to learn real patterns.",
+        "",
+        "It usually performs poorly on both training data and new data.",
+    ]
+    model_type = _get_model_type(context)
+    if model_type:
+        lines.append(f"\nCurrent model: {model_type}.")
+    if train_score is not None and test_score is not None:
+        train_rate = _as_rate(train_score)
+        test_rate = _as_rate(test_score)
+        if train_rate is not None and test_rate is not None:
+            if train_rate < 0.60 and test_rate < 0.60:
+                verdict = "This does look like underfitting because both train and test scores are weak."
+            elif abs(train_rate - test_rate) <= 0.03 and test_rate < 0.70:
+                verdict = "This may be mild underfitting because the gap is small but performance is still only moderate."
+            else:
+                verdict = "This does not look like classic underfitting from the available train/test scores."
+            lines.append(
+                f"Train score is {_fmt_pct(train_rate)} and test score is {_fmt_pct(test_rate)}. {verdict}"
+            )
+    elif fit_status:
+        lines.append(f"Your system's fit status is **{fit_status}**.")
+    else:
+        lines.append("Train/test comparison is not available, so underfitting cannot be confirmed from the current context.")
+    lines.append("\nNext step: if underfitting is present, try stronger features, a more expressive model, or better preprocessing before tuning thresholds.")
     return "\n".join(lines)
 # -------------------------
 # Intent handler registry
@@ -1788,6 +2067,7 @@ _INTENT_HANDLERS = {
     "data_stats": _handle_data_stats,
     "training_details": _handle_training_details,
     "overfitting": _handle_overfitting,
+    "underfitting": _handle_underfitting,
     # model tracking & explanation (Feature 1 & 2)
     "model_tracking": _handle_model_tracking,
     "model_explanation": _handle_model_explanation,
@@ -1798,7 +2078,7 @@ _INTENT_HANDLERS = {
 # Intent patterns & examples
 # -------------------------
 _INTENTS = [
-    (re.compile(r"\b(help|what can you do|how to|commands)\b"), "help"),
+    (re.compile(r"\b(help|what can you do|commands|how do i use (this|the app|the system)|how to use (this|the app|the system))\b"), "help"),
     (re.compile(r"\b(churn rate|what is the churn|current churn|how many left|customers left|how many churn)\b"), "churn_rate"),
     (re.compile(r"\b(is churn (high|low|moderate)|churn (high|low|moderate)|churn level|churn risk level)\b"), "churn_rate"),
     (re.compile(r"\b(why (are )?customers churning|drivers of churn|reasons for churn|why people leave)\b"), "top_drivers"),
@@ -1822,10 +2102,11 @@ _INTENTS = [
     (re.compile(r"\b(high risk|high.risk customers|at risk|most likely to churn|top risk)\b"), "high_risk"),
     (re.compile(r"\b(lifecycle|life.?cycle|early stage|mid stage|late stage|tenure stage|customer stage)\b"), "lifecycle"),
     (re.compile(r"\b(stats|statistics|distribution|numeric summary|data stats|correlation|mean value|average value|std deviation|show (me )?(the )?(stats|statistics|distribution|correlation))\b"), "data_stats"),
-    (re.compile(r"\b(overfit|overfitting|underfit|underfitting|generaliz(e|ation)|train.?test gap|fit status)\b"), "overfitting"),
+    (re.compile(r"\b(underfit|underfitting)\b"), "underfitting"),
+    (re.compile(r"\b(overfit|overfitting|generaliz(e|ation)|train.?test gap|fit status)\b"), "overfitting"),
     (re.compile(r"\b(training (detail|info|process)|how (was|is) (the )?model trained|training mode|target column|which column)\b"), "training_details"),
     # model tracking & comparison — "which model" removed to avoid conflict with available_models
-    (re.compile(r"\b(compare models?|best model|model comparison|models? trained)\b"), "model_tracking"),
+    (re.compile(r"\b(compare (my |our |trained |current )?models?|best (trained|current|my|our) model|model comparison|models? trained)\b"), "model_tracking"),
     # model explanation (Feature 2)
     (re.compile(r"\b(why (this|the|use|using|random forest|logistic|xgboost|catboost|decision tree|naive bayes|gradient|adaboost) ?model|why model used|explain (the )?model choice|why (is|was) .* (model|algorithm) (used|chosen|selected))\b"), "model_explanation"),
 ]
@@ -1850,6 +2131,7 @@ _INTENT_EXAMPLES = {
     "data_stats": ["show data statistics", "what is the average", "show distributions", "numeric summary"],
     "training_details": ["how was the model trained", "what is the training mode", "which target column", "training process"],
     "overfitting": ["is my model overfitting", "train test gap", "fit status", "does the model generalize"],
+    "underfitting": ["is my model underfitting", "underfit", "underfitting"],
     "model_tracking": ["which model is being used", "compare models", "best model", "show model comparison", "what models did i train"],
     "model_explanation": ["why this model", "why random forest", "why is logistic regression used", "explain the model choice", "why was xgboost selected"],
     "available_models": ["what models can i train", "list all models", "which algorithms are available", "what models does the system support"],
@@ -1911,323 +2193,18 @@ def _fuzzy_intent_match(query: str) -> Tuple[str, float]:
 # -------------------------
 # LLM helpers (OpenAI)
 # -------------------------
-def _build_system_prompt() -> str:
-    return (
-        # ── ROLE ──────────────────────────────────────────────────────────────
-        "You are a senior data analyst embedded inside a production customer churn platform. "
-        "The user's dataset has been processed. EDA, model training, predictions, and optional "
-        "segment/lifecycle/simulation analysis results are all provided in the Context below. "
-        "Your job: give precise, honest, business-ready answers — every time.\n\n"
-        # ── STEP 0: CLASSIFY FIRST ────────────────────────────────────────────
-        "════════════════════════════════════════\n"
-        "STEP 0 — CLASSIFY THE QUESTION BEFORE ANSWERING (MANDATORY)\n"
-        "════════════════════════════════════════\n"
-        "Every question falls into exactly one type. Identify it silently, then answer:\n\n"
-        "TYPE 1 — DATA QUESTION (about this user's specific numbers, models, results):\n"
-        "  → Use ONLY values from Context. Quote exact numbers. "
-        "Never invent, estimate, or paraphrase a number. "
-        "If a value is missing, say exactly: '[field] is not available yet — run [step] to generate it.'\n\n"
-        "TYPE 2 — CONCEPTUAL QUESTION (what is recall? how does XGBoost work? what causes churn?):\n"
-        "  → Answer from your expert ML knowledge. NEVER say 'not available' for general concepts. "
-        "After explaining, connect to the user's actual Context numbers only briefly where relevant. "
-        "Do not dump the full churn report for pure definitions.\n\n"
-        "TYPE 3 — MIXED QUESTION (is my recall good? is the model overfitting?):\n"
-        "  → Briefly explain the concept, then immediately apply it to the user's exact Context numbers.\n\n"
-        # ── HARD RULES ────────────────────────────────────────────────────────
-        "════════════════════════════════════════\n"
-        "HARD RULES — VIOLATION = WRONG ANSWER\n"
-        "════════════════════════════════════════\n\n"
-        "RULE 1 — NEVER HALLUCINATE MODELS:\n"
-        "The ONLY models that exist are those named in [CURRENT MODEL] and [MODEL HISTORY]. "
-        "If neither contains a model name, say: 'No model has been trained yet.' "
-        "Never invent or assume an algorithm name.\n\n"
-        "RULE 2 — NEVER CONFUSE ACTUAL VS PREDICTED CHURN RATE:\n"
-        "  ACTUAL churn rate  → source: [MODEL METRICS] → field: churn_rate\n"
-        "                       This is ground truth from training labels. The ONLY valid source.\n"
-        "                       Do NOT read actual churn rate from EDA — it is not stored there.\n"
-        "  PREDICTED churn rate → source: [PREDICTION RESULTS] → field: predicted_churn_rate\n"
-        "                         This is the model's forecast. Entirely different concept.\n"
-        "  ALWAYS label both explicitly: 'Actual churn rate: X%' and 'Predicted churn rate: Y%'.\n"
-        "  If both are present, ALWAYS state whether the model is underestimating or overestimating.\n"
-        "  NEVER present predicted_churn_rate as the actual/observed churn rate.\n\n"
-        "RULE 3 — RECALL DETERMINES MODEL QUALITY VERDICT (NO EXCEPTIONS):\n"
-        "  Recall < 50%  -> MUST say: 'This model is missing many churners. "
-        "It is not suitable for churn decisions in its current state.'\n"
-        "                  FORBIDDEN: 'accurate', 'performs well', 'good model', 'suitable for deployment'.\n"
-        "  Recall 50-69% -> MUST say: 'This model captures most churners, but recall can still improve.'\n"
-        "  Recall >= 70%  -> Strong. The model is strong at detecting churners.\n"
-        "  This rule overrides any positive signal from accuracy or ROC-AUC alone.\n\n"
-        "RULE 4 — NEVER INVENT DATA:\n"
-        "For TYPE 1 questions, if a Context field is missing, say so and name the step to run. "
-        "Never substitute a plausible-sounding number.\n\n"
-        "RULE 5 — NEVER CONTRADICT THE USER:\n"
-        "If the user states a fact about their own actions, accept it and respond accordingly.\n\n"
-        # ── MANDATORY CHECKLIST ───────────────────────────────────────────────
-        "════════════════════════════════════════\n"
-        "MANDATORY ANSWER CHECKLIST — MODEL / CHURN / PERFORMANCE QUESTIONS\n"
-        "════════════════════════════════════════\n"
-        "When answering ANY question about model quality, churn, predictions, or 'why is churn high', "
-        "your response MUST include ALL of the following that are available in Context. "
-        "If an item is not available, explicitly state it is missing.\n\n"
-        "  [ ] 1. Actual churn rate — from [MODEL METRICS] churn_rate\n"
-        "  [ ] 2. Predicted churn rate — from [PREDICTION RESULTS] predicted_churn_rate\n"
-        "  [ ] 3. Model metrics — accuracy, recall, F1, ROC-AUC from [MODEL METRICS]\n"
-        "  [ ] 4. Recall quality verdict — apply RULE 3 thresholds, give a clear judgment\n"
-        "  [ ] 5. Top churn drivers — from [TOP CHURN DRIVERS], explain what features drive churn\n\n"
-        "Answering with fewer than the available items above = incomplete answer. "
-        "Do NOT answer model/churn questions using a single metric in isolation.\n\n"
-        # ── MODEL HISTORY ─────────────────────────────────────────────────────
-        "════════════════════════════════════════\n"
-        "MODEL HISTORY — MANDATORY CONSULTATION\n"
-        "════════════════════════════════════════\n"
-        "- [MODEL HISTORY] contains every model trained, with full metrics.\n"
-        "- For ANY model-related question, you MUST read [MODEL HISTORY] first.\n"
-        "- NEVER say 'metrics not available' for a model whose numbers appear in [MODEL HISTORY].\n"
-        "- When comparing models, use ALL entries with their exact listed numbers — skip none.\n"
-        "- The active model is named in [CURRENT MODEL]. Use that exact name only.\n\n"
-        # ── AVAILABLE MODELS ──────────────────────────────────────────────────
-        "════════════════════════════════════════\n"
-        "AVAILABLE VS TRAINED MODELS\n"
-        "════════════════════════════════════════\n"
-        "- [AVAILABLE MODELS] = what the system supports for training (can be trained).\n"
-        "- [MODEL HISTORY]    = what the user has already trained.\n"
-        "- 'What models can I use/try/train?' → answer from [AVAILABLE MODELS].\n"
-        "- 'What have I trained / compare models?' → answer from [MODEL HISTORY].\n"
-        "- Never confuse these two lists.\n\n"
-        # ── RESPONSE STRUCTURE ────────────────────────────────────────────────
-        "════════════════════════════════════════\n"
-        "RESPONSE STRUCTURE — FOLLOW FOR EVERY ANSWER\n"
-        "════════════════════════════════════════\n"
-        "1. STATE   — Lead with the direct answer and exact numbers.\n"
-        "2. EXPLAIN — What does this mean in plain business language?\n"
-        "3. EVALUATE — Is this good, acceptable, or a problem? Why? "
-        "Use RULE 3 for model quality. Use domain knowledge for concepts.\n"
-        "4. SUGGEST — One concrete, actionable next step.\n\n"
-        "Style rules (all mandatory):\n"
-        "- Natural prose. No bullet points unless the user asks.\n"
-        "- Lead with the answer — never open with 'Based on the context' or 'Great question'.\n"
-        "- No 'I am an AI' disclaimers.\n"
-        "- If the user is rude, stay calm and professional. Never lecture.\n"
-        "- Concise: say exactly what is needed, nothing more."
-    )
 def _build_user_prompt(query: str, safe_context: Dict[str, Any]) -> str:
-    """
-    Build the full user-turn message sent to the LLM.
-    Every available section of the session context is included so the model
-    can reason over all results — exactly as if the user had uploaded the data
-    directly into ChatGPT.
-    """
-    sections: List[str] = []
-    # ── 1. Dataset / EDA ───────────────────────────────────────────────────
-    eda = safe_context.get("eda")
-    if eda:
-        eda_lines = ["[DATASET & EDA]"]
-        rows = eda.get("n_rows") or (eda.get("shape") or [None])[0]
-        cols_count = eda.get("n_cols") or (eda.get("shape") or [None, None])[1]
-        if rows:
-            eda_lines.append(f"  rows: {rows}")
-        if cols_count:
-            eda_lines.append(f"  columns: {cols_count}")
-        col_names = eda.get("columns")
-        if col_names:
-            listed = ", ".join(col_names[:40])
-            suffix = f" ... (+{len(col_names) - 40} more)" if len(col_names) > 40 else ""
-            eda_lines.append(f"  column names: {listed}{suffix}")
-        target = eda.get("target_column")
-        if target:
-            eda_lines.append(f"  target column (churn label): {target}")
-        missing = eda.get("missing_total")
-        if missing is not None:
-            eda_lines.append(f"  missing values total: {missing}")
-        churn_rate = eda.get("churn_rate") or eda.get("target_churn_rate")
-        if churn_rate is not None:
-            eda_lines.append(
-                f"  churn_rate (EDA): {churn_rate}"
-                f"  ← NOTE: use [MODEL METRICS] churn_rate for the authoritative actual churn rate"
-            )
-        sections.append("\n".join(eda_lines))
-    else:
-        sections.append("[DATASET & EDA]\n  not available (dataset not yet uploaded or EDA not run)")
-    # ── 2. Current model (always show explicitly) ──────────────────────────
-    current_model = safe_context.get("current_model") or ""
-    metrics = safe_context.get("metrics")
-    if not current_model and metrics:
-        current_model = metrics.get("model_type") or metrics.get("model") or ""
-    if current_model:
-        sections.append(
-            f"[CURRENT MODEL]\n"
-            f"  active model: {current_model}\n"
-            f"  NOTE: This is the ONLY active model. Do not name any other model as current."
-        )
-    else:
-        sections.append("[CURRENT MODEL]\n  not available (no model has been trained yet)")
-    # ── 3. Model metrics ───────────────────────────────────────────────────
-    if metrics:
-        m_lines = ["[MODEL METRICS — metrics belong to the CURRENT MODEL listed above]"]
-        # Actual churn rate may live here too (same concept as EDA churn_rate — ground truth)
-        metrics_churn = metrics.get("churn_rate")
-        if metrics_churn is not None:
-            m_lines.append(
-                f"  ACTUAL churn rate (authoritative — from training labels): {metrics_churn}"
-                f"  ← THIS is the real churn rate. Use ONLY this value when answering 'what is the churn rate?'"
-            )
-        for key in ("accuracy", "recall", "precision", "f1", "roc_auc"):
-            if key in metrics:
-                m_lines.append(f"  {key}: {metrics[key]}")
-        fit_status = metrics.get("fit_status") or metrics.get("fit")
-        if fit_status:
-            m_lines.append(f"  fit status: {fit_status}")
-        mode = metrics.get("mode") or metrics.get("training_mode")
-        if mode:
-            m_lines.append(f"  training mode: {mode}")
-        threshold = metrics.get("threshold")
-        if threshold is not None:
-            m_lines.append(f"  prediction threshold: {threshold}")
-        train_f1 = metrics.get("train_f1") or metrics.get("train_score")
-        test_f1 = metrics.get("test_f1") or metrics.get("f1")
-        if train_f1 and test_f1:
-            m_lines.append(f"  train F1: {train_f1}  |  test F1: {test_f1}")
-        suspicious = metrics.get("suspicious")
-        if suspicious is not None:
-            m_lines.append(f"  suspicious (near-perfect, possible data leakage): {suspicious}")
-        sections.append("\n".join(m_lines))
-    else:
-        sections.append("[MODEL METRICS]\n  not available (no model trained yet)")
-    # ── 4. Model history / comparison ──────────────────────────────────────
-    history = safe_context.get("model_history")
-    if history:
-        h_lines = [
-            f"[MODEL HISTORY — {len(history)} model(s) trained]",
-            "  IMPORTANT: Only these models have been trained. Do not mention any model not listed here.",
-            "  ALL entries below have valid metrics — never say a model lacks metrics if it appears here."
-        ]
-        for h in history:
-            name = h.get("model_type") or h.get("model") or "unknown"
-            susp = h.get("suspicious", False)
-            m2 = h.get("metrics") or {}
-            roc = m2.get("roc_auc", "n/a")
-            recall = m2.get("recall", "n/a")
-            f1 = m2.get("f1", "n/a")
-            acc = m2.get("accuracy", "n/a")
-            flag = " [SUSPICIOUS — possible data leakage, excluded from auto-selection]" if susp else ""
-            h_lines.append(
-                f"  - {name}: ROC-AUC={roc}, recall={recall}, F1={f1}, accuracy={acc}{flag}"
-            )
-        h_lines.append(
-            "  MANDATORY: When comparing models, use ALL entries above with their exact numbers."
-        )
-        sections.append("\n".join(h_lines))
-    else:
-        sections.append(
-            "[MODEL HISTORY]\n"
-            "  not available\n"
-            "  IMPORTANT: Do not mention or compare any model if no history is listed here."
-        )
-    # ── 5. SHAP / feature importance ───────────────────────────────────────
-    shap = safe_context.get("shap")
-    if shap:
-        top = shap.get("top_features") or []
-        if top:
-            s_lines = [f"[TOP CHURN DRIVERS — SHAP importance, top {len(top[:15])} features]"]
-            for f in top[:15]:
-                name = f.get("name", "?")
-                score = f.get("mean_abs_shap")
-                score_str = f"{score:.4f}" if score is not None else "n/a"
-                s_lines.append(f"  - {name}: mean_abs_shap={score_str}")
-            sections.append("\n".join(s_lines))
-    else:
-        sections.append("[SHAP / FEATURE IMPORTANCE]\n  not available (train a model to compute SHAP)")
-    # ── 6. Predictions ─────────────────────────────────────────────────────
-    predictions = safe_context.get("predictions")
-    if predictions:
-        p_lines = [
-            "[PREDICTION RESULTS — model's forecast on the dataset]",
-            "  NOTE: 'predicted_churn_rate' below is the MODEL'S PREDICTION, "
-            "not the historical actual churn rate from the dataset. Do NOT confuse these two."
-        ]
-        for key in ("total_customers", "total", "predicted_churn_rate", "predicted_churn",
-                    "high_risk", "medium_risk", "low_risk", "revenue_at_risk",
-                    "churn_count", "churn_rate"):
-            if key in predictions:
-                label = key
-                if key in ("predicted_churn_rate", "churn_rate"):
-                    label = f"{key} (PREDICTED by model)"
-                p_lines.append(f"  {label}: {predictions[key]}")
-        sections.append("\n".join(p_lines))
-    else:
-        sections.append("[PREDICTION RESULTS]\n  not available (run predictions after training)")
-    # ── 7. Simulation ──────────────────────────────────────────────────────
-    sim = safe_context.get("simulate")
-    if sim:
-        sim_lines = ["[RETENTION SIMULATION RESULTS]"]
-        for key in ("before_churn_rate", "after_churn_rate", "retained_customers",
-                    "revenue_saved", "action_cost", "roi"):
-            if key in sim:
-                sim_lines.append(f"  {key}: {sim[key]}")
-        sections.append("\n".join(sim_lines))
-    else:
-        sections.append("[SIMULATION RESULTS]\n  not available (run a simulation in the Simulate tab)")
-    # ── 8. Lifecycle risk ──────────────────────────────────────────────────
-    lifecycle = safe_context.get("lifecycle")
-    if lifecycle:
-        lc_lines = ["[LIFECYCLE RISK ANALYSIS]"]
-        lc_lines.append(f"  column used: {lifecycle.get('column_used', 'n/a')}")
-        lc_lines.append(f"  highest risk segment: {lifecycle.get('highest_risk_segment', 'n/a')}")
-        segments = lifecycle.get("segments")
-        if isinstance(segments, dict):
-            for stage, stats in segments.items():
-                if isinstance(stats, dict):
-                    rate = stats.get("churn_rate", "n/a")
-                    customers = stats.get("customers", "n/a")
-                    lc_lines.append(f"  {stage}: churn_rate={rate}, customers={customers}")
-        sections.append("\n".join(lc_lines))
-    else:
-        sections.append("[LIFECYCLE RISK]\n  not available (run lifecycle analysis)")
-    # ── 9. Segment analysis ────────────────────────────────────────────────
-    segment = safe_context.get("segment")
-    if segment:
-        seg_lines = ["[SEGMENT ANALYSIS RESULTS]"]
-        col = segment.get("column", "n/a")
-        mode = segment.get("mode", "")
-        seg_lines.append(f"  column analyzed: {col}  |  mode: {mode}")
-        segs = segment.get("segments") or []
-        for s in segs[:10]:
-            val = s.get("value", "?")
-            rate = s.get("churn_rate", "n/a")
-            customers = s.get("customers", "n/a")
-            churned = s.get("churned", "n/a")
-            seg_lines.append(f"  - {val}: churn_rate={rate}, customers={customers}, churned={churned}")
-        sections.append("\n".join(seg_lines))
-    else:
-        sections.append("[SEGMENT ANALYSIS]\n  not available (run segment analysis)")
-    # ── 10. Available models (what the system supports) ───────────────────
-    available_models = safe_context.get("available_models") or []
-    if available_models:
-        av_lines = [
-            "[AVAILABLE MODELS — algorithms this system supports for training]",
-            "  NOTE: These are models the user CAN train, not necessarily what they have trained.",
-            "  Use this section when the user asks 'what models can I use/train/try?'."
-        ]
-        for m in available_models:
-            av_lines.append(f"  - {m}")
-        sections.append("\n".join(av_lines))
-    # ── Assemble final prompt ──────────────────────────────────────────────
-    context_block = "\n\n".join(sections)
+    context_json = json.dumps(safe_context, indent=2, sort_keys=True)
     return (
-        f"Context:\n"
-        f"{'=' * 60}\n"
-        f"{context_block}\n"
-        f"{'=' * 60}\n\n"
-        f"User question: {redact_text(query)}\n\n"
-        f"INSTRUCTION: First classify this question:\n"
-        f"- If it asks about THIS USER'S specific data, models, or results → use ONLY the Context above. "
-        f"Never invent numbers. If a value is 'not available', say so and guide the user.\n"
-        f"- If it asks about an ML/analytics concept (overfitting, recall, AUC, etc.) → answer from "
-        f"expert knowledge, then connect to the user's Context data where relevant.\n"
-        f"- If mixed → explain the concept, then apply it to the Context data with exact numbers.\n"
-        f"For churn rate: ACTUAL comes only from [MODEL METRICS] churn_rate. "
-        f"PREDICTED comes only from [PREDICTION RESULTS] predicted_churn_rate. Always label which is which.\n"
-        f"Follow the reasoning structure: state → explain → evaluate → suggest. Be natural and direct."
+        "User Question:\n"
+        f"{redact_text(query)}\n\n"
+        "System Data (JSON):\n"
+        f"{context_json}\n\n"
+        "Instructions:\n"
+        "- Use system data ONLY if relevant.\n"
+        "- If question is general, ignore system data.\n"
+        "- If question is about the model, predictions, churn, segments, simulation, or data, use system data.\n"
+        "- Never invent, modify, or assume numeric values."
     )
 def _call_openai_chat(system_prompt: str, user_prompt: str, model: str, max_tokens: int = 800, temperature: float = 1.0, timeout: int = 180) -> str:
     if not OPENAI_AVAILABLE:
@@ -2254,11 +2231,57 @@ def _call_openai_chat(system_prompt: str, user_prompt: str, model: str, max_toke
         content = resp.choices[0].message.content
         return content.strip()
     return "LLM returned no content."
+def _answer_with_llm(query: str, context: Dict[str, Any], llm_provider: str, llm_model: str) -> str:
+    if llm_provider.lower() != "openai":
+        raise RuntimeError("That LLM provider is not supported yet. Please use the default OpenAI option.")
+    safe_ctx = redact_context(context or {})
+    system_prompt = (
+        "You are a smart AI assistant for a churn analysis system.\n\n"
+        "You behave like ChatGPT:\n"
+        "- Answer naturally and clearly.\n"
+        "- Answer ANY question, including random ones.\n\n"
+        "CRITICAL RULES:\n"
+        "- If system data is provided, treat it as TRUE.\n"
+        "- NEVER change or invent numbers.\n"
+        "- NEVER assume missing values.\n"
+        "- Use system data ONLY when relevant.\n\n"
+        "RESPONSE STYLE:\n"
+        "- No forced bullet dumps.\n"
+        "- No robotic structure.\n"
+        "- Explain like a human."
+    )
+    user_prompt = _build_user_prompt(query, safe_ctx)
+    return redact_text(_call_openai_chat(system_prompt, user_prompt, model=llm_model))
+def _llm_failure_notice(error: Exception) -> str:
+    err_str = str(error)
+    if "429" in err_str or "insufficient_quota" in err_str or "quota" in err_str.lower():
+        return (
+            "*(AI assistant unavailable - API quota reached. "
+            "Showing the best grounded system answer below.)*\n\n"
+        )
+    if "auth" in err_str.lower() or "api_key" in err_str.lower() or "401" in err_str:
+        return (
+            "*(AI assistant unavailable - API key issue. "
+            "Showing the best grounded system answer below.)*\n\n"
+        )
+    return (
+        "*(AI assistant encountered a temporary issue - "
+        "showing the best grounded system answer below.)*\n\n"
+    )
 # -------------------------
 # Fallback helper for open questions
 # -------------------------
 def _fallback_for_open_question(query: str, context: Dict[str, Any]) -> str:
     q = (query or "").lower()
+    if _is_concept_query(query):
+        return _handle_concept_question(query, context or {})
+    if _is_full_summary_query(query):
+        return _handle_full_summary(context or {})
+    if _is_model_advice_query(query):
+        return _handle_model_advice_question(context or {})
+    known_answer = _handle_known_ml_question(query, context or {})
+    if known_answer:
+        return known_answer
     if "improve" in q or "what should i do" in q or "recommend" in q:
         return _handle_recommend_actions(context or {})
     if "dataset" in q or "data" in q or "rows" in q or "upload" in q:
@@ -2271,45 +2294,34 @@ def _fallback_for_open_question(query: str, context: Dict[str, Any]) -> str:
         return _handle_segment_analysis(context or {})
     if "lifecycle" in q or "tenure" in q or "stage" in q:
         return _handle_lifecycle(context or {})
-    if "overfit" in q or "underfit" in q or "train test" in q or "fit status" in q:
+    if "underfit" in q:
+        return _handle_underfitting(context or {})
+    if "overfit" in q or "train test" in q or "fit status" in q:
         return _handle_overfitting(context or {})
     if "model" in q or "train" in q or "algorithm" in q:
         return _handle_model_info(context or {})
-    return (
-        "I'm not fully sure how to answer that with the current data.\n\n"
-        "Here are a few things you can try:\n"
-        "- 'What is the churn rate?'\n"
-        "- 'Why are customers churning?'\n"
-        "- 'How good is the model?'\n"
-        "- 'What actions should we take?'\n"
-        "- 'What does my dataset contain?'\n"
-        "- 'How many customers are predicted to churn?'\n\n"
-        "If you need broader analysis, enable the AI assistant (LLM toggle) for more flexible answers."
-    )
+    if _is_system_related_query(query):
+        return _build_system_aware_answer(query, context or {})
+    return _general_missing_system_answer(query, context)
 # -------------------------
 # Public API
 # -------------------------
-def respond_to_query(query: str, context: Dict[str, Any], use_llm: bool = False, llm_provider: str = "openai", llm_model: str = "gpt-4o-mini") -> str:
+def respond_to_query(query: str, context: Dict[str, Any], use_llm: bool = True, llm_provider: str = "openai", llm_model: str = "gpt-4o-mini") -> str:
     """
-    Main entrypoint for the chatbot.
-    Control flow (strict separation — LLM is always checked first):
-      1. PII guard — always applied first.
-      2. If use_llm is True:
-           → build full redacted context
-           → call LLM
-           → return LLM answer                          ← happy path
-         If LLM fails for ANY reason (quota, network, timeout, auth):
-           → fall through to rule-based system
-           → prepend a one-line soft notice so the user knows
-             (the app NEVER crashes or shows an error page)
-      3. Rule-based system (use_llm False, or LLM fell through):
-           a. Precise regex intent matching
-           b. Fuzzy intent matching (difflib + TF-IDF)
-           c. Final keyword fallback
+    Main chatbot entrypoint.
+
+    LLM mode is the primary architecture: when enabled, call the LLM and return
+    immediately. Deterministic handlers are only for non-LLM fallback mode.
     """
     if not query or not isinstance(query, str):
         return "It looks like your message was empty. Try asking something like 'What is the churn rate?' or 'Show me the top churn factors.'"
-    # ── PII guard (always applied) ──────────────────────────────────────────
+    context = context or {}
+
+    # LLM mode is final. No intent matching, handlers, enforcement, grounded
+    # builders, or fallback logic may run after this return.
+    if use_llm:
+        return _answer_with_llm(query, context, llm_provider, llm_model)
+
     if (re.search(r"[\w\.-]+@[\w\.-]+\.\w+", query)
             or re.search(r"\b\d{3}[-.\s]?\d{2}[-.\s]?\d{4}\b", query)
             or re.search(r"\b\d{10}\b", query)):
@@ -2318,102 +2330,65 @@ def respond_to_query(query: str, context: Dict[str, Any], use_llm: bool = False,
             "phone numbers, or ID numbers in chat.\n\n"
             "To look up a specific customer, use the **Explain** tab and enter their row number from the dataset."
         )
-    # ── BRANCH A: LLM mode ─────────────────────────────────────────────────
-    # Exact factual handlers run before the LLM; open-ended questions still use LLM mode.
-    # On ANY failure the system falls through to Branch B — the app never fails.
-    # Exact data/hybrid intents are answered deterministically even when LLM mode
-    # is enabled. The LLM can explain broad concepts, but handlers own facts.
     q_low = _normalize(query)
-    if _is_concept_query(query):
-        return _handle_concept_question(query, context or {})
-    if use_llm:
-        for pattern, intent_key in _INTENTS:
-            if pattern.search(q_low) and _is_data_intent(intent_key):
-                handler = _INTENT_HANDLERS.get(intent_key)
-                if handler:
-                    try:
-                        answer = handler(context or {})
-                        return _enforce_answer_completeness(answer, query, context or {}, intent_key)
-                    except Exception:
-                        return "Something went wrong while generating that answer. Try rephrasing your question."
-        intent_key, score = _fuzzy_intent_match(query)
-        if intent_key and score >= 0.75 and _is_data_intent(intent_key):
-            handler = _INTENT_HANDLERS.get(intent_key)
-            if handler:
-                try:
-                    answer = handler(context or {})
-                    return _enforce_answer_completeness(answer, query, context or {}, intent_key)
-                except Exception:
-                    pass
-    _prepend_notice = ""   # set only when LLM falls back
-    if use_llm:
+
+    def safe_handler(intent_key: str, score: float | None = None) -> str:
         try:
-            safe_ctx = redact_context(context or {})
-            system_prompt = _build_system_prompt()
-            user_prompt = _build_user_prompt(query, safe_ctx)
-            if llm_provider.lower() != "openai":
-                return "That LLM provider isn't supported yet. Please use the default OpenAI option."
-            answer = _call_openai_chat(system_prompt, user_prompt, model=llm_model)
-            answer = redact_text(answer)
-            return _enforce_answer_completeness(answer, query, context or {})   # success: return here, never touch rule-based
-        except Exception as e:
-            # ── Determine the most helpful one-liner for the notice ──────────
-            err_str = str(e)
-            if "429" in err_str or "insufficient_quota" in err_str or "quota" in err_str.lower():
-                notice = (
-                    "*(AI assistant unavailable — API quota reached. "
-                    "Turn off the LLM toggle for uninterrupted access. "
-                    "Showing rule-based answer below.)*\n\n"
-                )
-            elif "auth" in err_str.lower() or "api_key" in err_str.lower() or "401" in err_str:
-                notice = (
-                    "*(AI assistant unavailable — API key issue. "
-                    "Showing rule-based answer below.)*\n\n"
-                )
-            else:
-                notice = (
-                    "*(AI assistant encountered a temporary issue — "
-                    "showing rule-based answer below.)*\n\n"
-                )
-            _prepend_notice = notice
-            # fall through to Branch B — use_llm stays True but we skip the if block now
-    # ── BRANCH B: Rule-based system (logic unchanged from original) ─────────
-    q_low = _normalize(query)
-    # 1) Precise regex intent matching
-    for pattern, intent_key in _INTENTS:
-        if pattern.search(q_low):
-            handler = _INTENT_HANDLERS.get(intent_key)
-            if handler:
-                try:
-                    answer = handler(context or {})
-                    answer = _enforce_answer_completeness(answer, query, context or {}, intent_key)
-                    return _prepend_notice + answer
-                except Exception:
-                    return _prepend_notice + "Something went wrong while generating that answer. Try rephrasing your question."
-    # 2) Fuzzy matching (difflib + optional TF-IDF)
-    intent_key, score = _fuzzy_intent_match(query)
-    if intent_key and score >= 0.6:
-        handler = _INTENT_HANDLERS.get(intent_key)
-        if handler:
-            try:
-                resp = handler(context or {})
-                resp = _enforce_answer_completeness(resp, query, context or {}, intent_key)
-                return _prepend_notice + resp + f"\n\n*(Matched as: {intent_key}, confidence: {score:.0%})*"
-            except Exception:
-                pass
-    # 3) Final keyword fallback
-    if "recommend" in q_low or "what should i do" in q_low or "improve" in q_low:
-        answer = _handle_recommend_actions(context or {})
-        return _prepend_notice + _enforce_answer_completeness(answer, query, context or {}, "recommend_actions")
-    return _prepend_notice + (
-        "I'm not fully sure about that one. Here are some things I can help with:\n\n"
-        "- 'What does my dataset contain?'\n"
-        "- 'Are there missing values?'\n"
-        "- 'What is the churn rate?'\n"
-        "- 'Why are customers churning?'\n"
-        "- 'How good is the model?' / 'Which model did I train?'\n"
-        "- 'How many customers are predicted to churn?'\n"
-        "- 'What was the ROI of the last simulation?'\n"
-        "- 'Show me all results'\n\n"
-        "You can also enable the **AI assistant toggle** for broader, more flexible answers."
+            return _answer_from_handler(intent_key, query, context, score)
+        except Exception:
+            return "Something went wrong while generating that answer. Try rephrasing your question."
+
+    # 1. Strict system routes are deterministic because they answer exact app
+    # facts or app commands.
+    intent_key, _score = _match_intent(query)
+    if intent_key in _PRE_LLM_STRICT_INTENTS:
+        return safe_handler(intent_key)
+
+    # 2. Pure concept questions must stay clean: no churn state, no metrics,
+    # no "train a model first" answer unless the user asks about this session.
+    if _is_concept_query(query):
+        return _handle_concept_question(query, context)
+
+    llm_notice = ""
+
+    # 4. Offline/fallback deterministic routes.
+    if _is_general_chat_query(query):
+        return llm_notice + (
+            "I am the assistant inside this churn analysis app. I can explain ML ideas, "
+            "help interpret churn results, and answer normal questions. When the AI mode is on, "
+            "I can handle broader conversation more flexibly; when it is off, I stick to a smaller built-in answer set."
+        )
+
+    if _is_model_advice_query(query):
+        return llm_notice + _handle_model_advice_question(context)
+
+    if "predict" in q_low and any(k in q_low for k in ("actual", "lower", "higher", "underestimate", "overestimate", "different")):
+        return llm_notice + _build_system_aware_answer(query, context)
+
+    # 5. Exact data questions use deterministic handlers only when LLM is off
+    # or unavailable.
+    if intent_key in _STRICT_HANDLER_INTENTS:
+        return llm_notice + safe_handler(intent_key)
+
+    # 6. Hybrid/system analysis uses the specific grounded handler.
+    if intent_key in _GROUNDED_HANDLER_INTENTS:
+        return llm_notice + safe_handler(intent_key)
+
+    # 7. Broad questions about this system get a grounded synthesized read.
+    if _needs_completeness_guard(query):
+        return llm_notice + _build_grounded_complete_answer(query, context, use_llm=False)
+
+    # 8. Fuzzy matching only rescues likely system questions, not general chat.
+    system_markers = (
+        "churn", "customer", "model", "metric", "predict", "prediction",
+        "dataset", "data", "row", "column", "feature", "risk", "segment",
+        "lifecycle", "simulation", "roi", "train", "accuracy", "recall",
+        "precision", "f1", "auc",
     )
+    if any(marker in q_low for marker in system_markers):
+        fuzzy_intent, fuzzy_score = _match_intent(query, fuzzy_threshold=0.6)
+        if fuzzy_intent and fuzzy_intent != intent_key:
+            return llm_notice + safe_handler(fuzzy_intent, fuzzy_score)
+
+    return llm_notice + _fallback_for_open_question(query, context)
+
