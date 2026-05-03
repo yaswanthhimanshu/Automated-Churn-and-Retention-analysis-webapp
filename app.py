@@ -135,17 +135,22 @@ def new_session():
         "eda": None,
         "eda_full": None,
         "model": None,
+        "meta": None,
         "metrics": None,
         "predictions": None,
+        "predictions_summary": None,
         "shap": None,
         "simulate_result": None,
+        "segment_result": None,
+        "lifecycle_risk": None,
+        "current_model": None,
         "created_ts": now_ts,
         "uploaded_at": None,
         "encoding": None,
 
         "train_progress": 0,
         "train_status_msg": "Idle",
-        "model_history": [],      # stores last 5 trained model metric summaries
+        "model_history": [],      # stores all trained model metric summaries
     }
     return sid
 
@@ -239,10 +244,15 @@ def upload():
             "eda": eda_summary,
             "eda_full": full_report,
             "model": None,
+            "meta": None,
             "metrics": None,
             "predictions": None,
+            "predictions_summary": None,
             "shap": None,
-            "simulate_result": None
+            "simulate_result": None,
+            "segment_result": None,
+            "lifecycle_risk": None,
+            "current_model": None
         })
 
         return jsonify({
@@ -304,10 +314,15 @@ def train():
             "train_progress": 0,
             "train_status_msg": "Queued",
             "model": None,
+            "meta": None,
             "metrics": None,
             "predictions": None,
+            "predictions_summary": None,
             "shap": None,
-            "simulate_result": None
+            "simulate_result": None,
+            "segment_result": None,
+            "lifecycle_risk": None,
+            "current_model": None
         })
         
         # model_type selection 
@@ -370,13 +385,36 @@ def train():
                     progress_callback(-1, f"Training failed: {msg}")
                     return
 
-                # save model & metrics so prediction/explain/simulate can use it
+                # save model & metrics so prediction/explain/simulate/chat can use it
                 s["model"] = model_obj
-                s["metrics"] = meta.get("metrics") if isinstance(meta, dict) else None
                 s["meta"] = meta
 
-                # Append to model history (last 5 only, metrics only)
+                # Append to model history 
                 _m = meta.get("metrics") or {}
+                metrics_for_chat = dict(_m)
+                metrics_for_chat.update({
+                    "model_type": model_type,
+                    "target_col": target_col,
+                    "trained_on": meta.get("trained_on", ""),
+                    "fit_status": meta.get("fit_status", ""),
+                    "fit_reason": meta.get("fit_reason", ""),
+                    "train_score": meta.get("train_score"),
+                    "test_score": meta.get("test_score"),
+                    "threshold": getattr(core, "DEFAULT_THRESHOLD", 0.35),
+                })
+                try:
+                    target_series = df[target_col].dropna()
+                    if pd.api.types.is_numeric_dtype(target_series):
+                        encoded_target = target_series.astype(float).map(lambda v: 1 if v > 0 else 0)
+                    else:
+                        encoded_target = target_series.map(
+                            lambda v: 1 if str(v).strip().lower() in ("1", "yes", "true", "y", "churn", "positive") else 0
+                        )
+                    metrics_for_chat["churn_rate"] = float(encoded_target.mean())
+                except Exception:
+                    pass
+                s["metrics"] = metrics_for_chat
+
                 _entry = {
                     "model_type": model_type,
                     "accuracy":   round(float(_m.get("accuracy",  0) or 0), 4),
@@ -393,7 +431,8 @@ def train():
                 }
                 history = s.get("model_history") or []
                 history.append(_entry)
-                s["model_history"] = history[-5:]
+                s["model_history"] = history
+                s["current_model"] = model_type   # track latest trained model for chatbot
                 
                 progress_callback(95, "Computing SHAP summary...")
                 time.sleep(0.5)
@@ -476,6 +515,21 @@ def predict():
             "high":   int((probs >= 0.7).sum()),
             "medium": int(((probs >= 0.35) & (probs < 0.7)).sum()),
             "low":    int((probs < 0.35).sum()),
+        }
+
+        # Store generic predictions summary for chatbot (dataset-independent format)
+        session["predictions_summary"] = {
+            "total_customers":      int(len(df_original)),
+            "churn_count":          int(df_original["predicted_churn"].sum()),
+            "predicted_churn_rate": round(float(df_original["predicted_churn"].mean()), 4),
+            "high_risk":            risk_counts["high"],
+            "medium_risk":          risk_counts["medium"],
+            "low_risk":             risk_counts["low"],
+            "probability_summary": {
+                "min":  round(float(probs.min()), 4),
+                "max":  round(float(probs.max()), 4),
+                "mean": round(float(probs.mean()), 4),
+            },
         }
 
         # Determined preview mode:
@@ -652,6 +706,9 @@ def time_churn():
             predictions_df=predictions_df
         )
         session["lifecycle_risk"] = lifecycle
+
+        # Store segment result generically for chatbot
+        session["segment_result"] = result
 
         return jsonify({
             "time_churn": result,
@@ -867,10 +924,16 @@ def chat():
         use_llm = bool(data.get("use_llm", False))
 
         context = {
-            "eda": session.get("eda"),
-            "metrics": session.get("metrics"),
-            "shap": session.get("shap"),
-            "simulate": session.get("simulate_result"),
+            "eda":           session.get("eda"),
+            "metrics":       session.get("metrics"),
+            "shap":          session.get("shap"),
+            "simulate":      session.get("simulate_result"),
+            # new — required for fixes and features
+            "predictions":   session.get("predictions_summary"),
+            "segment_result": session.get("segment_result"),
+            "model_history": session.get("model_history"),
+            "lifecycle":     session.get("lifecycle_risk"),
+            "current_model": session.get("current_model"),
         }
         answer = chatbot.respond_to_query(query, context, use_llm=use_llm)
         return jsonify({"answer": answer, "session_id": sid})
